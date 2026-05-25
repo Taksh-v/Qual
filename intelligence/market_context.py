@@ -319,6 +319,30 @@ def build_commodities_section(ind: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_crypto_section(ind: dict[str, Any]) -> str:
+    """Bitcoin, Ethereum, and digital asset sentiment."""
+    lines = ["=== CRYPTO & DIGITAL ASSETS ==="]
+
+    btc = _safe(ind, "btc_usd")
+    eth = _safe(ind, "eth_usd")
+
+    if btc is not None:
+        btc_regime = (
+            "bullish momentum (>60k)" if btc > 60000 else
+            "consolidation range" if btc > 45000 else
+            "bearish / risk-off (<40k)"
+        )
+        lines.append(f"BTC/USD: ${btc:,.0f} → {btc_regime}")
+
+    if eth is not None:
+        lines.append(f"ETH/USD: ${eth:,.0f}")
+
+    if not lines[1:]:
+        lines.append("Crypto data unavailable")
+
+    return "\n".join(lines)
+
+
 def build_labour_activity_section(ind: dict[str, Any]) -> str:
     """Labour market & activity summary."""
     lines = ["=== LABOUR & ACTIVITY DASHBOARD ==="]
@@ -462,6 +486,7 @@ def build_full_market_context(ind: dict[str, Any]) -> str:
         build_equity_section(ind),
         build_fx_section(ind),
         build_commodities_section(ind),
+        build_crypto_section(ind),
         build_labour_activity_section(ind),
         build_money_liquidity_section(ind),
         build_india_section(ind),

@@ -5,6 +5,7 @@ import os
 import re
 import asyncio
 import time
+import hashlib
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
@@ -16,7 +17,7 @@ except ImportError:
     pass
 
 from fastapi import FastAPI, HTTPException, Request, Security, Depends
-from fastapi.responses import PlainTextResponse, StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse, FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, ConfigDict
@@ -38,7 +39,7 @@ from intelligence.indicator_parser import (
     get_regime_inputs_from_indicators,
     sanitize_indicator_values,
 )
-from intelligence.context_retriever import retrieve_relevant_context
+from intelligence.context_retriever import retrieve_relevant_context, get_last_retrieval_telemetry
 from intelligence.macro_engine import macro_intelligence_pipeline, get_last_model_used
 from intelligence.live_market_data import (
     fetch_live_indicators,
@@ -49,7 +50,10 @@ from intelligence.live_market_data import (
 )
 from intelligence.question_classifier import classify_question
 from intelligence.regime_detector import detect_regime
+from intelligence.regime_warning import compute_regime_warning
+from intelligence.external_shock import compute_external_shock_state
 from intelligence.news_health_checker import check_news_health, check_news_health_quick
+from intelligence.data_quality import evaluate_evidence_integrity
 from intelligence.response_enhancer import score_response
 from intelligence.response_middleware import normalize_api_payload
 from intelligence.query_logger import log_query, read_recent, compute_metrics
@@ -62,6 +66,7 @@ from ingestion.fundamentals import (
 )
 from ingestion.market_data import get_market_snapshot, format_snapshot_for_prompt
 from config.indicators import INDICATOR_META
+from intelligence.admin_logger import admin_logger
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -149,6 +154,82 @@ app.mount("/static", StaticFiles(directory="api/static"), name="static")
 logger.info("News Intelligence RAG API starting up. Auth=%s RateLimit=%s",
     "enabled" if _VALID_API_KEYS else "dev-mode", _RL_DEFAULT)
 
+
+def _is_enabled(flag_name: str, default: str = "0") -> bool:
+    raw = os.getenv(flag_name, default).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+_REGIME_WARNING_RANK = {"watch": 0, "elevated": 1, "imminent": 2}
+_SHOCK_MODE_STATE: dict[str, str] = {"snapshot": "normal", "market_stream": "normal"}
+
+
+def _merge_regime_warning(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+    downgrade_hysteresis: float = 0.14,
+) -> dict[str, Any] | None:
+    if current is None:
+        return previous
+    if previous is None:
+        return current
+
+    prev_tier = str(previous.get("warning_tier", "watch") or "watch").lower()
+    curr_tier = str(current.get("warning_tier", "watch") or "watch").lower()
+    prev_rank = _REGIME_WARNING_RANK.get(prev_tier, 0)
+    curr_rank = _REGIME_WARNING_RANK.get(curr_tier, 0)
+
+    prev_prob = float(previous.get("transition_probability") or 0.0)
+    curr_prob = float(current.get("transition_probability") or 0.0)
+
+    if curr_rank > prev_rank:
+        return current
+
+    if curr_rank < prev_rank and curr_prob > max(0.0, prev_prob - downgrade_hysteresis):
+        held = dict(previous)
+        held["transition_probability"] = round(max(curr_prob, prev_prob - 0.05), 3)
+        held["triggers"] = list(dict.fromkeys([*(previous.get("triggers", []) or []), "hysteresis_hold"]))[:8]
+        held["invalidations"] = (current.get("invalidations", []) or previous.get("invalidations", []))[:8]
+        return held
+
+    smoothed = dict(current)
+    if curr_rank == prev_rank:
+        smoothed["transition_probability"] = round((0.65 * prev_prob) + (0.35 * curr_prob), 3)
+    return smoothed
+
+
+def _track_external_shock_transition(scope: str, external_shock: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not external_shock or not isinstance(external_shock, dict):
+        return external_shock
+
+    mode = str(external_shock.get("shock_mode", "normal") or "normal").lower()
+    prev_mode = _SHOCK_MODE_STATE.get(scope, "normal")
+
+    out = dict(external_shock)
+    out["previous_shock_mode"] = prev_mode
+    out["mode_transition"] = "none"
+
+    if mode != prev_mode:
+        if prev_mode == "normal" and mode in {"elevated", "crisis"}:
+            out["mode_transition"] = "entered_shock_mode"
+        elif prev_mode in {"elevated", "crisis"} and mode == "normal":
+            out["mode_transition"] = "exited_shock_mode"
+        else:
+            out["mode_transition"] = "changed_within_shock_modes"
+
+        logger.info(
+            "[external_shock] scope=%s transition=%s from=%s to=%s score=%.3f inputs=%s",
+            scope,
+            out.get("mode_transition"),
+            prev_mode,
+            mode,
+            float(out.get("external_shock_score") or 0.0),
+            json.dumps(out.get("score_inputs", {}), sort_keys=True),
+        )
+
+    _SHOCK_MODE_STATE[scope] = mode
+    return out
+
 from intelligence.cache_utils import _TieredCache, AsyncCacheStampedeGuard
 
 # ── Response cache for /ask endpoint ─────────────────────────────────────────
@@ -171,6 +252,12 @@ _FEEDBACK_PATH = os.getenv(
     str(_pathlib.Path("data") / "feedback_log.jsonl"),
 )
 _feedback_lock = Lock()
+
+_DECISION_OUTCOME_PATH = os.getenv(
+    "DECISION_OUTCOME_LOG_PATH",
+    str(_pathlib.Path("data") / "decision_outcome_log.jsonl"),
+)
+_decision_outcome_lock = Lock()
 
 
 @app.get("/.well-known/appspecific/com.chrome.devtools.json", include_in_schema=False)
@@ -196,8 +283,11 @@ class IntelligenceRequest(BaseModel):
     question: str
     geography: str = "US"
     horizon: str = "MEDIUM_TERM"
-    response_mode: str = "brief"
+    response_mode: str | None = None
     indicator_overrides: dict[str, float] = Field(default_factory=dict)
+    counterfactual_shocks: dict[str, float] = Field(default_factory=dict)
+    user_profile: dict[str, Any] = Field(default_factory=dict)
+    profile_enforcement_mode: str = "advisory"
 
 
 class HedgeRequest(BaseModel):
@@ -301,20 +391,317 @@ def _normalized_overrides(overrides: dict[str, Any]) -> dict[str, float]:
     return normalized
 
 
+def _normalized_counterfactual_shocks(shocks: dict[str, Any]) -> dict[str, float]:
+    return _normalized_overrides(shocks or {})
+
+
+def _signal_direction(signal: str) -> str:
+    s = (signal or "").upper()
+    if "BULLISH" in s or "RISK_ON" in s:
+        return "risk_on"
+    if "BEARISH" in s or "RISK_OFF" in s:
+        return "risk_off"
+    return "mixed"
+
+
+def _compute_counterfactual_result(snapshot: dict[str, Any], shocks: dict[str, Any]) -> dict[str, Any] | None:
+    normalized_shocks = _normalized_counterfactual_shocks(shocks)
+    if not normalized_shocks:
+        return None
+
+    base_indicators = dict(snapshot.get("detected_indicators", {}) or {})
+    shocked_indicators = dict(base_indicators)
+    shocked_indicators.update(normalized_shocks)
+    shocked_indicators = sanitize_indicator_values(shocked_indicators)
+
+    shocked_regime = detect_regime(**get_regime_inputs_from_indicators(shocked_indicators))
+    shocked_cross_asset = analyze_cross_asset(shocked_indicators)
+
+    baseline_regime = snapshot.get("regime", {})
+    baseline_cross = snapshot.get("cross_asset", {})
+
+    indicator_deltas: list[dict[str, Any]] = []
+    for key in sorted(normalized_shocks.keys()):
+        base_val = _safe_float(base_indicators.get(key))
+        shocked_val = _safe_float(shocked_indicators.get(key))
+        delta_val = None
+        if base_val is not None and shocked_val is not None:
+            delta_val = round(shocked_val - base_val, 6)
+        indicator_deltas.append(
+            {
+                "key": key,
+                "baseline": base_val,
+                "shocked": shocked_val,
+                "delta": delta_val,
+            }
+        )
+
+    base_signal = baseline_cross.get("overall_signal", "")
+    shocked_signal = shocked_cross_asset.get("overall_signal", "")
+
+    base_regime_name = baseline_regime.get("regime")
+    shocked_regime_name = shocked_regime.get("regime")
+
+    regime_changed = bool(base_regime_name and shocked_regime_name and base_regime_name != shocked_regime_name)
+    signal_changed = bool(base_signal and shocked_signal and base_signal != shocked_signal)
+
+    base_dir = _signal_direction(base_signal)
+    shocked_dir = _signal_direction(shocked_signal)
+    if base_dir == shocked_dir:
+        action_delta = "no_change"
+    elif base_dir == "risk_on" and shocked_dir in {"risk_off", "mixed"}:
+        action_delta = "more_defensive"
+    elif base_dir == "risk_off" and shocked_dir in {"risk_on", "mixed"}:
+        action_delta = "more_risk_seeking"
+    else:
+        action_delta = "rebalance_selective"
+
+    return {
+        "requested": True,
+        "baseline": {
+            "regime": baseline_regime,
+            "cross_asset": baseline_cross,
+        },
+        "shocked": {
+            "regime": shocked_regime,
+            "cross_asset": shocked_cross_asset,
+            "applied_shocks": normalized_shocks,
+        },
+        "delta_summary": {
+            "regime_changed": regime_changed,
+            "baseline_regime": base_regime_name,
+            "shocked_regime": shocked_regime_name,
+            "signal_changed": signal_changed,
+            "baseline_signal": base_signal,
+            "shocked_signal": shocked_signal,
+            "action_delta": action_delta,
+            "quality_delta": {
+                "context_chunks_delta": 0,
+                "citation_count_delta": 0,
+                "retrieval_reused": True,
+                "summary": "context_reused_no_additional_retrieval",
+            },
+            "indicator_deltas": indicator_deltas,
+        },
+    }
+
+
+def _contains_any_term(text: str, terms: list[str]) -> tuple[bool, str | None]:
+    lowered = (text or "").lower()
+    for term in terms:
+        t = (term or "").strip().lower()
+        if t and t in lowered:
+            return True, term
+    return False, None
+
+
+def _extract_upper_tokens(text: str) -> list[str]:
+    tokens = re.findall(r"\b[A-Z]{2,6}\b", str(text or ""))
+    stop = {
+        "AND", "THE", "WITH", "FROM", "THAT", "THIS", "WILL", "RISK", "MODE",
+        "HIGH", "LOW", "MEDIUM", "BASE", "BULL", "BEAR", "CPI", "GDP", "VIX",
+        "USD", "US", "EU", "UK", "JPY", "FX", "ETF",
+    }
+    out: list[str] = []
+    for token in tokens:
+        t = token.strip().upper()
+        if t and t not in stop:
+            out.append(t)
+    return list(dict.fromkeys(out))
+
+
+def _is_action_line(text: str) -> bool:
+    low = str(text or "").lower()
+    verbs = [
+        "overweight", "underweight", "long", "short", "buy", "sell",
+        "hedge", "add", "reduce", "increase", "rotate", "trim",
+    ]
+    return any(v in low for v in verbs)
+
+
+def _apply_personalization(
+    response_text: str,
+    response_struct: dict[str, str],
+    decision_stub: dict[str, Any] | None,
+    user_profile: dict[str, Any],
+    enforcement_mode: str,
+) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+    profile = user_profile or {}
+    mode = (enforcement_mode or "advisory").strip().lower()
+    if mode not in {"advisory", "strict"}:
+        mode = "advisory"
+
+    banned_assets = [str(x).strip() for x in (profile.get("banned_assets") or []) if str(x).strip()]
+    allowed_instruments = [str(x).strip() for x in (profile.get("allowed_instruments") or []) if str(x).strip()]
+    constraints = [str(x).strip() for x in (profile.get("constraints") or []) if str(x).strip()]
+    risk_style = str(profile.get("risk_style") or "").strip()
+    mandate = str(profile.get("mandate") or "").strip()
+    limits = profile.get("limits") if isinstance(profile.get("limits"), dict) else {}
+    max_recommendations_raw = limits.get("max_recommendations", profile.get("max_recommendations", None))
+    max_recommendations: int | None = None
+    try:
+        if max_recommendations_raw is not None:
+            parsed_limit = int(max_recommendations_raw)
+            if parsed_limit > 0:
+                max_recommendations = parsed_limit
+    except (TypeError, ValueError):
+        max_recommendations = None
+
+    applied_constraints: list[str] = []
+    if risk_style:
+        applied_constraints.append(f"risk_style={risk_style}")
+    if mandate:
+        applied_constraints.append(f"mandate={mandate}")
+    applied_constraints.extend(constraints)
+    if banned_assets:
+        applied_constraints.append(f"banned_assets={','.join(banned_assets)}")
+    if allowed_instruments:
+        applied_constraints.append(f"allowed_instruments={','.join(allowed_instruments)}")
+    if max_recommendations is not None:
+        applied_constraints.append(f"max_recommendations={max_recommendations}")
+
+    recommendation_adjustments: list[str] = []
+    out_text = response_text or ""
+    out_stub = dict(decision_stub) if isinstance(decision_stub, dict) else decision_stub
+
+    allowed_set = {x.upper() for x in allowed_instruments}
+    banned_set = {x.upper() for x in banned_assets}
+
+    if banned_assets:
+        replaced_count = 0
+        out_lines: list[str] = []
+        for raw in out_text.splitlines():
+            has_banned, banned = _contains_any_term(raw, banned_assets)
+            if has_banned:
+                recommendation_adjustments.append(f"Detected banned asset reference: {banned}")
+                if mode == "strict":
+                    out_lines.append("- [Removed due to profile constraint]")
+                    replaced_count += 1
+                else:
+                    out_lines.append(raw)
+            else:
+                out_lines.append(raw)
+        if mode == "strict" and replaced_count:
+            out_text = "\n".join(out_lines)
+            recommendation_adjustments.append(f"Removed {replaced_count} line(s) due to strict profile enforcement")
+
+        if out_stub and isinstance(out_stub, dict):
+            rec = str(out_stub.get("recommendation") or "")
+            has_banned, banned = _contains_any_term(rec, banned_assets)
+            if has_banned:
+                recommendation_adjustments.append(f"Decision stub recommendation referenced banned asset: {banned}")
+                if mode == "strict":
+                    out_stub["recommendation"] = "Recommendation adjusted to comply with profile constraints."
+
+    if allowed_set:
+        out_lines: list[str] = []
+        replaced_count = 0
+        for raw in out_text.splitlines():
+            line_tokens = _extract_upper_tokens(raw)
+            disallowed = [t for t in line_tokens if t not in allowed_set and t not in banned_set]
+            if _is_action_line(raw) and disallowed:
+                recommendation_adjustments.append(
+                    f"Detected instrument(s) outside allowed universe: {','.join(disallowed[:4])}"
+                )
+                if mode == "strict":
+                    out_lines.append("- [Removed due to allowed instrument constraint]")
+                    replaced_count += 1
+                else:
+                    out_lines.append(raw)
+            else:
+                out_lines.append(raw)
+        if mode == "strict" and replaced_count:
+            out_text = "\n".join(out_lines)
+            recommendation_adjustments.append(
+                f"Removed {replaced_count} line(s) due to allowed instrument constraints"
+            )
+
+        if out_stub and isinstance(out_stub, dict):
+            rec = str(out_stub.get("recommendation") or "")
+            rec_tokens = _extract_upper_tokens(rec)
+            disallowed = [t for t in rec_tokens if t not in allowed_set and t not in banned_set]
+            if disallowed:
+                recommendation_adjustments.append(
+                    f"Decision stub recommendation outside allowed universe: {','.join(disallowed[:4])}"
+                )
+                if mode == "strict":
+                    out_stub["recommendation"] = "Recommendation adjusted to allowed instrument universe."
+
+    if max_recommendations is not None:
+        action_count = 0
+        out_lines: list[str] = []
+        trimmed = 0
+        for raw in out_text.splitlines():
+            if _is_action_line(raw):
+                action_count += 1
+                if action_count > max_recommendations:
+                    recommendation_adjustments.append("Detected recommendation count above max_recommendations limit")
+                    if mode == "strict":
+                        out_lines.append("- [Removed due to max recommendation limit]")
+                        trimmed += 1
+                    else:
+                        out_lines.append(raw)
+                    continue
+            out_lines.append(raw)
+        if mode == "strict" and trimmed:
+            out_text = "\n".join(out_lines)
+            recommendation_adjustments.append(
+                f"Removed {trimmed} line(s) due to max recommendation limit"
+            )
+
+    rationale_bits = []
+    if applied_constraints:
+        rationale_bits.append("constraints applied")
+    if recommendation_adjustments:
+        rationale_bits.append("recommendation adjusted")
+    if applied_constraints or recommendation_adjustments:
+        rationale = (
+            f"Mode={mode}; constraints={len(applied_constraints)}; "
+            f"adjustments={len(recommendation_adjustments)}; "
+            + ", ".join(rationale_bits)
+        )
+    else:
+        rationale = f"Mode={mode}; no profile constraints triggered"
+
+    personalization = {
+        "profile_version": str(profile.get("profile_version") or "v1"),
+        "enforcement_mode": mode,
+        "applied_constraints": applied_constraints,
+        "recommendation_adjustments": recommendation_adjustments,
+        "rationale": rationale,
+    }
+    return out_text, personalization, out_stub
+
+
 def _collect_indicator_inputs(
     req: IntelligenceRequest,
-) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     overrides = _normalized_overrides(req.indicator_overrides)
     context_chunks: list[dict[str, Any]] = []
     context_text = ""
     live_meta: dict[str, Any] = {}
+    retrieval_telemetry: dict[str, Any] = {}
     try:
         # Reduced from top_k=25/keep_latest=15 → 12/8 to cut retrieval + prompt size.
-        context_chunks = retrieve_relevant_context(req.question, top_k=12, keep_latest=8)
+        context_chunks = retrieve_relevant_context(req.question, top_k=12, keep_latest=8, geography=req.geography)
+        retrieval_telemetry = get_last_retrieval_telemetry() or {}
         context_text = " ".join(c.get("text", "") for c in context_chunks)
     except Exception:
         context_chunks = []
         context_text = ""
+        retrieval_telemetry = {
+            "cache_hit": False,
+            "rewrite_enabled": False,
+            "hybrid_enabled": False,
+            "rrf_applied": False,
+            "bm25_used": False,
+            "semantic_candidates": 0,
+            "bm25_candidates": 0,
+            "pre_dedupe_candidates": 0,
+            "post_dedupe_candidates": 0,
+            "final_count": 0,
+            "fallback_reason": "retriever_error",
+        }
 
     # Fetch live FRED data first (authoritative baseline)
     try:
@@ -326,17 +713,49 @@ def _collect_indicator_inputs(
     from_question = extract_indicators_from_text(req.question)
     # Priority: overrides > extracted from text/question > live FRED
     all_indicators = sanitize_indicator_values({**live_data, **from_context, **from_question, **overrides})
-    return all_indicators, context_chunks, live_meta
+    return all_indicators, context_chunks, live_meta, retrieval_telemetry
 
 
 def _build_snapshot(req: IntelligenceRequest) -> dict[str, Any]:
     classification = classify_question(req.question)
-    all_indicators, context_chunks, live_meta = _collect_indicator_inputs(req)
+    all_indicators, context_chunks, live_meta, retrieval_telemetry = _collect_indicator_inputs(req)
     overrides = _normalized_overrides(req.indicator_overrides)
 
     regime_inputs = get_regime_inputs_from_indicators(all_indicators)
     regime = detect_regime(**regime_inputs)
     cross_asset = analyze_cross_asset(all_indicators)
+    regime_warning = None
+    if _is_enabled("FEATURE_REGIME_EARLY_WARNING"):
+        regime_warning = compute_regime_warning(regime, cross_asset, all_indicators)
+
+    external_shock = None
+    if _is_enabled("FEATURE_EXTERNAL_SHOCK_OVERRIDE"):
+        event_stress = 0.0
+        if _is_enabled("FEATURE_EXTERNAL_SHOCK_NEWS_SIGNAL"):
+            try:
+                nh = check_news_health_quick()
+                event_stress = max(0.0, min((100 - int(nh.health_score)) / 100.0, 1.0))
+            except Exception:
+                event_stress = 0.0
+        try:
+            external_shock = compute_external_shock_state(
+                indicators=all_indicators,
+                cross_asset=cross_asset,
+                regime=regime,
+                event_stress_score=event_stress,
+            )
+            external_shock = _track_external_shock_transition("snapshot", external_shock)
+        except Exception:
+            external_shock = {
+                "external_shock_score": 0.0,
+                "shock_mode": "normal",
+                "trigger_conditions": ["shock_pipeline_failed_fallback_normal"],
+                "invalidation_conditions": ["pipeline_recovered"],
+                "scenario_reweighting": "rule_first",
+                "confidence_degradation": {"score_penalty": 0, "band_penalty": 0, "scenario_range_widening": "none"},
+                "manual_review_required": False,
+            }
+            external_shock = _track_external_shock_transition("snapshot", external_shock)
 
     critical = []
     for key, (label, unit) in INDICATOR_META.items():
@@ -371,7 +790,7 @@ def _build_snapshot(req: IntelligenceRequest) -> dict[str, Any]:
         if len(sources) >= 5:
             break
 
-    return {
+    snapshot_payload = {
         "question": req.question,
         "geography": req.geography,
         "horizon": req.horizon,
@@ -385,13 +804,19 @@ def _build_snapshot(req: IntelligenceRequest) -> dict[str, Any]:
             "context_chunks": len(context_chunks),
             "has_overrides": bool(overrides),
             "sources": sources,
+            "retrieval_telemetry": retrieval_telemetry,
         },
     }
+    if regime_warning is not None:
+        snapshot_payload["regime_warning"] = regime_warning
+    if external_shock is not None:
+        snapshot_payload["external_shock"] = external_shock
+    return snapshot_payload
 
 
 def _fallback_snapshot(req: IntelligenceRequest, reason: str = "") -> dict[str, Any]:
     missing_inputs = [reason] if reason else ["Snapshot temporarily unavailable"]
-    return {
+    payload = {
         "question": req.question,
         "geography": req.geography,
         "horizon": req.horizon,
@@ -412,6 +837,25 @@ def _fallback_snapshot(req: IntelligenceRequest, reason: str = "") -> dict[str, 
             "sources": [],
         },
     }
+    if _is_enabled("FEATURE_REGIME_EARLY_WARNING"):
+        payload["regime_warning"] = {
+            "warning_tier": "watch",
+            "transition_probability": 0.2,
+            "likely_next_regime": "TRANSITIONAL",
+            "triggers": ["snapshot_unavailable"],
+            "invalidations": ["snapshot_recovered"],
+        }
+    if _is_enabled("FEATURE_EXTERNAL_SHOCK_OVERRIDE"):
+        payload["external_shock"] = {
+            "external_shock_score": 0.0,
+            "shock_mode": "normal",
+            "trigger_conditions": ["snapshot_unavailable"],
+            "invalidation_conditions": ["snapshot_recovered"],
+            "scenario_reweighting": "rule_first",
+            "confidence_degradation": {"score_penalty": 0, "band_penalty": 0, "scenario_range_widening": "none"},
+            "manual_review_required": False,
+        }
+    return payload
 
 
 def _parse_unified_response(response_text: str) -> dict[str, str]:
@@ -428,6 +872,7 @@ def _parse_unified_response(response_text: str) -> dict[str, str]:
         "watch_next": "",
         "time_horizons": "",
         "confidence": "",
+        "strategic_synthesis": "",
         # legacy / compat fields
         "why_likely": "",
         "market_map": "",
@@ -444,7 +889,7 @@ def _parse_unified_response(response_text: str) -> dict[str, str]:
             fields["data_snapshot"] = line.split(":", 1)[1].strip()
         elif lower.startswith("causal chain:"):
             fields["causal_chain"] = line.split(":", 1)[1].strip()
-        elif lower.startswith("what is happening:"):
+        elif lower.startswith("situation report:") or lower.startswith("what is happening:"):
             fields["what_is_happening"] = line.split(":", 1)[1].strip()
             if not fields["why_likely"]:
                 fields["why_likely"] = fields["what_is_happening"]
@@ -472,7 +917,269 @@ def _parse_unified_response(response_text: str) -> dict[str, str]:
             fields["action_plan"] = line.split(":", 1)[1].strip()
         elif lower.startswith("confidence:"):
             fields["confidence"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("strategic synthesis"):
+            parsed = line.split(":", 1)[1].strip() if ":" in line else ""
+            fields["strategic_synthesis"] = parsed
     return fields
+
+
+def _append_jsonl(path: str, lock: Lock, entry: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+def _read_jsonl(path: str, lock: Lock) -> list[dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    out: list[dict[str, Any]] = []
+    with lock:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return out
+
+
+def _write_jsonl(path: str, lock: Lock, entries: list[dict[str, Any]]) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with lock:
+        with open(path, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+
+
+def _extract_decision_stub(question: str, response_struct: dict[str, str], quality: dict[str, Any]) -> dict[str, Any] | None:
+    recommendation = (
+        (response_struct.get("action_plan") or "").strip()
+        or (response_struct.get("direct_answer") or "").strip()
+    )
+    if not recommendation:
+        return None
+
+    horizon = (response_struct.get("time_horizons") or "").strip() or "7-30d"
+    trigger = (response_struct.get("watch_next") or "").strip() or "Monitor next macro print"
+    invalidation = (response_struct.get("main_risks") or "").strip() or "Core thesis contradicted by incoming data"
+    confidence = (quality.get("band") or "MEDIUM").upper()
+    confidence_score = max(0.0, min(float(quality.get("score", 50)) / 100.0, 1.0))
+
+    decision_id = hashlib.sha1(
+        f"{question}|{recommendation}|{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:16]
+
+    return {
+        "decision_id": decision_id,
+        "recommendation": recommendation,
+        "horizon": horizon,
+        "trigger": trigger,
+        "invalidation": invalidation,
+        "confidence": confidence,
+        "confidence_score": round(confidence_score, 3),
+        "status": "open",
+    }
+
+
+def _decision_outcome_label_from_rating(rating: int) -> tuple[str, float]:
+    if rating >= 4:
+        return "hit", 1.0
+    if rating <= 2:
+        return "miss", 0.0
+    return "mixed", 0.5
+
+
+def _close_open_decision_for_feedback(question: str, rating: int, comment: str) -> int:
+    entries = _read_jsonl(_DECISION_OUTCOME_PATH, _decision_outcome_lock)
+    if not entries:
+        return 0
+
+    q_norm = (question or "").strip().lower()
+    outcome_label, realized_accuracy = _decision_outcome_label_from_rating(rating)
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    updates = 0
+    for idx in range(len(entries) - 1, -1, -1):
+        row = entries[idx]
+        if (row.get("status") or "open") != "open":
+            continue
+        if (row.get("question", "").strip().lower()) != q_norm:
+            continue
+        row["status"] = "closed"
+        row["closed_ts"] = now_ts
+        row["feedback_rating"] = int(rating)
+        row["feedback_comment"] = (comment or "")[:1000]
+        row["realized_outcome"] = outcome_label
+        row["realized_accuracy"] = realized_accuracy
+        updates += 1
+        break
+
+    if updates:
+        _write_jsonl(_DECISION_OUTCOME_PATH, _decision_outcome_lock, entries)
+    return updates
+
+
+def _compute_decision_outcome_metrics() -> dict[str, Any]:
+    entries = _read_jsonl(_DECISION_OUTCOME_PATH, _decision_outcome_lock)
+    feedback_entries = _read_jsonl(_FEEDBACK_PATH, _feedback_lock)
+
+    def _qnorm(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    feedback_by_question: dict[str, list[dict[str, Any]]] = {}
+    for row in feedback_entries:
+        qn = _qnorm(row.get("question"))
+        if not qn:
+            continue
+        feedback_by_question.setdefault(qn, []).append(row)
+
+    if not entries:
+        return {
+            "total": 0,
+            "open": 0,
+            "closed": 0,
+            "hit_rate_pct": None,
+            "avg_calibration_error": None,
+            "feedback_count": len(feedback_entries),
+            "linked_feedback_count": 0,
+            "linked_feedback_rate_pct": None,
+            "avg_feedback_rating_for_closed": None,
+            "path": _DECISION_OUTCOME_PATH,
+        }
+
+    total = len(entries)
+    open_count = sum(1 for e in entries if (e.get("status") or "open") == "open")
+    closed_rows = [e for e in entries if (e.get("status") or "open") == "closed"]
+    closed_count = len(closed_rows)
+    hits = sum(1 for e in closed_rows if e.get("realized_outcome") == "hit")
+    hit_rate = round((hits / closed_count) * 100.0, 1) if closed_count else None
+
+    calibration_errors: list[float] = []
+    for row in closed_rows:
+        conf = row.get("confidence_score")
+        acc = row.get("realized_accuracy")
+        try:
+            if conf is None or acc is None:
+                continue
+            calibration_errors.append(abs(float(conf) - float(acc)))
+        except (TypeError, ValueError):
+            continue
+
+    avg_calibration_error = (
+        round(sum(calibration_errors) / len(calibration_errors), 4)
+        if calibration_errors
+        else None
+    )
+
+    linked_feedback_count = 0
+    linked_feedback_ratings: list[float] = []
+    for row in closed_rows:
+        linked = feedback_by_question.get(_qnorm(row.get("question")), [])
+        if not linked:
+            continue
+        linked_feedback_count += len(linked)
+        for fb in linked:
+            try:
+                linked_feedback_ratings.append(float(fb.get("rating")))
+            except (TypeError, ValueError):
+                continue
+
+    linked_feedback_rate_pct = (
+        round((linked_feedback_count / max(1, len(feedback_entries))) * 100.0, 1)
+        if feedback_entries
+        else None
+    )
+    avg_feedback_rating_for_closed = (
+        round(sum(linked_feedback_ratings) / len(linked_feedback_ratings), 3)
+        if linked_feedback_ratings
+        else None
+    )
+
+    return {
+        "total": total,
+        "open": open_count,
+        "closed": closed_count,
+        "hit_rate_pct": hit_rate,
+        "avg_calibration_error": avg_calibration_error,
+        "feedback_count": len(feedback_entries),
+        "linked_feedback_count": linked_feedback_count,
+        "linked_feedback_rate_pct": linked_feedback_rate_pct,
+        "avg_feedback_rating_for_closed": avg_feedback_rating_for_closed,
+        "path": _DECISION_OUTCOME_PATH,
+    }
+
+
+def _quality_band_from_score(score: int) -> str:
+    if score >= 80:
+        return "HIGH"
+    if score >= 60:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _apply_external_shock_adaptation(
+    response_text: str,
+    response_struct: dict[str, str],
+    quality: dict[str, Any],
+    external_shock: dict[str, Any] | None,
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    if not external_shock:
+        return response_text, response_struct, quality
+
+    mode = str(external_shock.get("shock_mode", "normal") or "normal").lower()
+    if mode == "normal":
+        return response_text, response_struct, quality
+
+    degradation = external_shock.get("confidence_degradation", {}) if isinstance(external_shock, dict) else {}
+    score_penalty = int(degradation.get("score_penalty", 0) or 0)
+    old_score = int(quality.get("score", 55) or 55)
+    new_score = max(10, old_score - score_penalty)
+    quality["score"] = new_score
+    quality["band"] = _quality_band_from_score(new_score)
+
+    old_conf = (response_struct.get("confidence") or "MEDIUM - Partial data available; interpret with caution.").strip()
+    scenario_widen = degradation.get("scenario_range_widening", "none")
+    adapted_conf = (
+        f"{quality['band']} - Adaptive confidence mode ({mode.upper()}); "
+        f"scenario range widened={scenario_widen}; prioritize risk management."
+    )
+    response_struct["confidence"] = adapted_conf
+
+    lines = response_text.splitlines()
+    replaced = False
+    for idx, line in enumerate(lines):
+        if line.strip().lower().startswith("confidence:"):
+            lines[idx] = f"Confidence: {adapted_conf}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"Confidence: {adapted_conf}")
+    if mode in {"elevated", "crisis"}:
+        lines.append(
+            f"Scenarios: Adaptive {mode.upper()} mode active — directional certainty reduced; downside-risk controls prioritized."
+        )
+        lines.append(
+            "Scenario reweighting: "
+            f"{external_shock.get('scenario_reweighting', 'rule_first')}"
+        )
+        if bool(external_shock.get("manual_review_required")):
+            lines.append("Manual review: Recommended before executing high-conviction directional trades.")
+
+    if old_conf and old_conf != adapted_conf:
+        quality["shock_confidence_override"] = {
+            "from": old_conf,
+            "to": adapted_conf,
+            "mode": mode,
+        }
+    quality["shock_mode"] = mode
+    quality["scenario_reweighting"] = str(external_shock.get("scenario_reweighting") or "rule_first")
+    quality["manual_review_required"] = bool(external_shock.get("manual_review_required"))
+
+    return "\n".join(lines).strip(), response_struct, quality
 
 
 def _estimate_quality(snapshot: dict[str, Any], response_text: str) -> dict[str, Any]:
@@ -517,10 +1224,95 @@ def _make_structured_payload(
     response_text: str,
     model_used: str,
     response_mode: str = "brief",
+    question: str = "",
+    persist_decision: bool = True,
+    counterfactual_result: dict[str, Any] | None = None,
+    user_profile: dict[str, Any] | None = None,
+    profile_enforcement_mode: str = "advisory",
 ) -> dict[str, Any]:
     quality = _estimate_quality(snapshot, response_text)
+    retrieval_telemetry = (
+        snapshot.get("evidence_coverage", {}).get("retrieval_telemetry", {})
+        if isinstance(snapshot, dict)
+        else {}
+    )
+    quality_warnings: list[str] = []
     response_struct = _parse_unified_response(response_text)
-    contract_probe = normalize_api_payload({"answer": response_text}, mode=response_mode)
+    evidence_integrity: dict[str, Any] | None = None
+    regime_warning = snapshot.get("regime_warning") if isinstance(snapshot, dict) else None
+    decision_stub: dict[str, Any] | None = None
+    personalization: dict[str, Any] | None = None
+    external_shock = snapshot.get("external_shock") if isinstance(snapshot, dict) else None
+    if _is_enabled("FEATURE_EVIDENCE_INTEGRITY"):
+        evidence_integrity = evaluate_evidence_integrity(
+            response_text=response_text,
+            evidence_coverage=snapshot.get("evidence_coverage", {}),
+        )
+        status = str((evidence_integrity or {}).get("status", "") or "").lower()
+        unsupported = int((evidence_integrity or {}).get("unsupported_claim_count", 0) or 0)
+        if status in {"warning", "review_required"}:
+            quality_warnings.append(
+                (
+                    f"Evidence integrity {status.upper()}: "
+                    f"{unsupported} unsupported claim(s) detected."
+                )
+            )
+        if status == "review_required":
+            quality_warnings.append("Manual review recommended before acting on this response.")
+
+    if _is_enabled("FEATURE_DECISION_OUTCOME_LOOP"):
+        decision_stub = _extract_decision_stub(question, response_struct, quality)
+        if decision_stub is not None and persist_decision:
+            outcome_entry = {
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+                "question": (question or "")[:300],
+                "status": "open",
+                "model_used": model_used or "N/A",
+                "quality_score": quality.get("score"),
+                "quality_band": quality.get("band"),
+                **decision_stub,
+            }
+            try:
+                _append_jsonl(_DECISION_OUTCOME_PATH, _decision_outcome_lock, outcome_entry)
+            except Exception as exc:
+                logger.warning("[decision_outcome] persist failed: %s", exc)
+
+    if _is_enabled("FEATURE_PERSONALIZED_PLAYBOOK"):
+        response_text, personalization, decision_stub = _apply_personalization(
+            response_text=response_text,
+            response_struct=response_struct,
+            decision_stub=decision_stub,
+            user_profile=user_profile or {},
+            enforcement_mode=profile_enforcement_mode,
+        )
+        response_struct = _parse_unified_response(response_text)
+
+    if _is_enabled("FEATURE_EXTERNAL_SHOCK_OVERRIDE"):
+        response_text, response_struct, quality = _apply_external_shock_adaptation(
+            response_text=response_text,
+            response_struct=response_struct,
+            quality=quality,
+            external_shock=external_shock,
+        )
+
+    contract_probe = normalize_api_payload(
+        {
+            "answer": response_text,
+            "evidence_integrity": evidence_integrity,
+            "regime_warning": regime_warning,
+            "decision_stub": decision_stub,
+            "counterfactual_result": counterfactual_result,
+            "personalization": personalization,
+        },
+        mode=response_mode,
+    )
+
+    contract = dict(contract_probe.get("_response_contract", {}))
+    contract_warnings = list(contract.get("validation_warnings", []))
+    for warning in quality_warnings:
+        if warning not in contract_warnings:
+            contract_warnings.append(warning)
+    contract["validation_warnings"] = contract_warnings
 
     def _add_point(points: list[dict[str, str]], title: str, text: str) -> None:
         t = (text or "").strip()
@@ -532,17 +1324,35 @@ def _make_structured_payload(
     _add_point(key_points, "Direct answer", response_struct.get("direct_answer", ""))
     _add_point(key_points, "Market impact", response_struct.get("market_impact", ""))
     _add_point(key_points, "Main risks", response_struct.get("main_risks", ""))
+    _add_point(key_points, "Strategic synthesis", response_struct.get("strategic_synthesis", ""))
     _add_point(key_points, "What to watch next", response_struct.get("watch_next", ""))
     _add_point(key_points, "Action plan", response_struct.get("action_plan", ""))
-    return {
+    payload = {
         "snapshot": snapshot,
         "response_text": response_text,
         "response_struct": response_struct,
         "key_points": key_points,
-        "quality": quality,
+        "quality": {
+            **quality,
+            "warnings": quality_warnings,
+            "retrieval_telemetry": retrieval_telemetry,
+        },
         "model_used": model_used or "N/A",
-        "_response_contract": contract_probe.get("_response_contract", {}),
+        "_response_contract": contract,
     }
+    if evidence_integrity is not None:
+        payload["evidence_integrity"] = evidence_integrity
+    if regime_warning is not None:
+        payload["regime_warning"] = regime_warning
+    if decision_stub is not None:
+        payload["decision_stub"] = decision_stub
+    if counterfactual_result is not None:
+        payload["counterfactual_result"] = counterfactual_result
+    if personalization is not None:
+        payload["personalization"] = personalization
+    if external_shock is not None:
+        payload["external_shock"] = external_shock
+    return payload
 
 
 def _run_analysis(req: IntelligenceRequest) -> tuple[dict[str, Any], str, str]:
@@ -581,18 +1391,27 @@ def intelligence_snapshot(req: IntelligenceRequest):
 @_rl(_RL_LLM)
 async def intelligence_analyze(req: IntelligenceRequest, request: Request):
     # ── Cache check ──────────────────────────────────────────────────────────
-    cache_key = f"{req.question.strip().lower()}|{req.geography}|{req.horizon}|{req.response_mode}"
+    shocks_key = json.dumps(req.counterfactual_shocks or {}, sort_keys=True)
+    cache_key = f"{req.question.strip().lower()}|{req.geography}|{req.horizon}|{req.response_mode}|{shocks_key}"
 
     async def _compute_intel() -> dict:
         t_start = time.time()
         error_msg: str | None = None
         try:
             snapshot, response_text, model_used = _run_analysis(req)
+            counterfactual_result = None
+            if _is_enabled("FEATURE_COUNTERFACTUAL_SIMULATOR"):
+                counterfactual_result = _compute_counterfactual_result(snapshot, req.counterfactual_shocks)
             payload = _make_structured_payload(
                 snapshot,
                 response_text,
                 model_used,
                 response_mode=req.response_mode,
+                question=req.question,
+                persist_decision=True,
+                counterfactual_result=counterfactual_result,
+                user_profile=req.user_profile,
+                profile_enforcement_mode=req.profile_enforcement_mode,
             )
         except HTTPException as exc:
             error_msg = str(exc.detail)
@@ -604,6 +1423,8 @@ async def intelligence_analyze(req: IntelligenceRequest, request: Request):
             latency_ms = int((time.time() - t_start) * 1000)
             if error_msg is None:
                 q = payload.get("quality", {})
+                rt = q.get("retrieval_telemetry", {}) if isinstance(q, dict) else {}
+                decision_stub = payload.get("decision_stub") or payload.get("_response_contract", {}).get("decision_stub", {})
                 # Compute sentiment on the response text
                 _resp_text = payload.get("response", "") or ""
                 _sent = score_sentiment(_resp_text)
@@ -619,6 +1440,11 @@ async def intelligence_analyze(req: IntelligenceRequest, request: Request):
                     cache_hit=False,
                     sentiment_label=_sent.get("label"),
                     sentiment_score=_sent.get("score"),
+                    retrieval_hybrid_enabled=rt.get("hybrid_enabled"),
+                    retrieval_rrf_applied=rt.get("rrf_applied"),
+                    retrieval_fallback_reason=rt.get("fallback_reason"),
+                    retrieval_top_chunks=rt.get("top_chunks") or [],
+                    decision_id=(decision_stub or {}).get("decision_id"),
                 )
             else:
                 log_query(
@@ -647,6 +1473,15 @@ def intelligence_export(req: IntelligenceRequest):
         response_text,
         model_used,
         response_mode=req.response_mode,
+        question=req.question,
+        persist_decision=False,
+        counterfactual_result=(
+            _compute_counterfactual_result(snapshot, req.counterfactual_shocks)
+            if _is_enabled("FEATURE_COUNTERFACTUAL_SIMULATOR")
+            else None
+        ),
+        user_profile=req.user_profile,
+        profile_enforcement_mode=req.profile_enforcement_mode,
     )
 
     regime = s["snapshot"]["regime"]
@@ -701,11 +1536,17 @@ async def intelligence_stream(req: IntelligenceRequest, request: Request):
                 elif event.stage == "synthesis":
                     yield _sse("progress", {"stage": "synthesis", "message": "Synthesizing Markdown..."})
                     yield _sse("section_start", {"section": "response"})
+                elif event.stage == "clear_stream":
+                    response_text = ""
+                    yield _sse("clear_stream", {"message": "clearing buffer"})
                 elif event.stage == "token":
                     chunk = event.data["text"]
                     response_text += chunk
                     yield _sse("token", {"section": "response", "text": chunk})
                 elif event.stage == "final":
+                    counterfactual_result = None
+                    if _is_enabled("FEATURE_COUNTERFACTUAL_SIMULATOR"):
+                        counterfactual_result = _compute_counterfactual_result(snapshot, req.counterfactual_shocks)
                     yield _sse(
                         "final",
                         _make_structured_payload(
@@ -713,6 +1554,11 @@ async def intelligence_stream(req: IntelligenceRequest, request: Request):
                             response_text.strip(),
                             "Agentic RAG",
                             response_mode=req.response_mode,
+                            question=req.question,
+                            persist_decision=True,
+                            counterfactual_result=counterfactual_result,
+                            user_profile=req.user_profile,
+                            profile_enforcement_mode=req.profile_enforcement_mode,
                         ),
                     )
         except Exception as exc:
@@ -755,6 +1601,7 @@ def market_data_live_stream(request: Request):
     stream_high: dict[str, float] = {}
     stream_low: dict[str, float] = {}
     sticky_dir: dict[str, str] = {}
+    stream_regime_warning: dict[str, Any] | None = None
 
     sleep_open_s = int(os.getenv("MARKET_DATA_STREAM_SLEEP_OPEN_SEC", "60"))
     sleep_closed_s = int(os.getenv("MARKET_DATA_STREAM_SLEEP_CLOSED_SEC", "120"))
@@ -802,11 +1649,58 @@ def market_data_live_stream(request: Request):
         return formatted
 
     async def event_gen():
-        nonlocal prev
+        nonlocal prev, stream_regime_warning
         while True:
             try:
                 for live, meta in stream_live_indicators():
                     formatted = _format_live(live, meta)
+                    live_cross_asset = analyze_cross_asset(live)
+
+                    regime_warning_live = None
+                    if _is_enabled("FEATURE_REGIME_EARLY_WARNING"):
+                        try:
+                            regime_inputs = get_regime_inputs_from_indicators(live)
+                            live_regime = detect_regime(**regime_inputs)
+                            raw_warning = compute_regime_warning(live_regime, live_cross_asset, live)
+                            regime_warning_live = _merge_regime_warning(stream_regime_warning, raw_warning)
+                            stream_regime_warning = regime_warning_live
+                        except Exception:
+                            regime_warning_live = stream_regime_warning or {
+                                "warning_tier": "watch",
+                                "transition_probability": 0.2,
+                                "likely_next_regime": "TRANSITIONAL",
+                                "triggers": ["live_warning_calc_failed"],
+                                "invalidations": ["calc_recovered"],
+                            }
+
+                    shock_block = None
+                    if _is_enabled("FEATURE_EXTERNAL_SHOCK_OVERRIDE"):
+                        try:
+                            event_stress = 0.0
+                            if _is_enabled("FEATURE_EXTERNAL_SHOCK_NEWS_SIGNAL"):
+                                try:
+                                    nh = check_news_health_quick()
+                                    event_stress = max(0.0, min((100 - int(nh.health_score)) / 100.0, 1.0))
+                                except Exception:
+                                    event_stress = 0.0
+                            shock_block = compute_external_shock_state(
+                                indicators=live,
+                                cross_asset=live_cross_asset,
+                                regime={"confidence": "LOW", "regime": "TRANSITIONAL"},
+                                event_stress_score=event_stress,
+                            )
+                            shock_block = _track_external_shock_transition("market_stream", shock_block)
+                        except Exception:
+                            shock_block = {
+                                "external_shock_score": 0.0,
+                                "shock_mode": "normal",
+                                "trigger_conditions": ["stream_shock_calc_failed"],
+                                "invalidation_conditions": ["calc_recovered"],
+                                "scenario_reweighting": "rule_first",
+                                "confidence_degradation": {"score_penalty": 0, "band_penalty": 0, "scenario_range_widening": "none"},
+                                "manual_review_required": False,
+                            }
+                            shock_block = _track_external_shock_transition("market_stream", shock_block)
                     sleep_s   = sleep_open_s if any_price_market_open() else sleep_closed_s
                     payload   = {
                         "indicators":        formatted,
@@ -819,7 +1713,12 @@ def market_data_live_stream(request: Request):
                         "fetch_ms":          meta.get("fetch_ms"),
                         "from_cache":        meta.get("from_cache", False),
                         "sleep_interval_s":  sleep_s,
+                        "cross_asset_signal": live_cross_asset.get("overall_signal", "MIXED"),
                     }
+                    if regime_warning_live is not None:
+                        payload["regime_warning"] = regime_warning_live
+                    if shock_block is not None:
+                        payload["external_shock"] = shock_block
                     yield f"event: update\ndata: {json.dumps(payload)}\n\n"
             except Exception as exc:
                 yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
@@ -981,7 +1880,20 @@ def get_metrics():
       - model_distribution (which model served N% of requests)
     """
     entries = read_recent(n=2000)
-    return compute_metrics(entries)
+    metrics = compute_metrics(entries)
+    if _is_enabled("FEATURE_DECISION_OUTCOME_LOOP"):
+        metrics["decision_outcomes"] = _compute_decision_outcome_metrics()
+    return metrics
+
+
+@app.get("/decision_outcomes/summary")
+def decision_outcome_summary():
+    if not _is_enabled("FEATURE_DECISION_OUTCOME_LOOP"):
+        return {
+            "status": "disabled",
+            "message": "Enable FEATURE_DECISION_OUTCOME_LOOP to access decision outcome summaries.",
+        }
+    return _compute_decision_outcome_metrics()
 
 
 class FeedbackRequest(BaseModel):
@@ -1014,7 +1926,19 @@ def submit_feedback(req: FeedbackRequest):
     except Exception as exc:
         logger.error("[feedback] write failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to persist feedback") from exc
-    return {"status": "ok", "message": "Feedback recorded. Thank you."}
+
+    linked_decisions = 0
+    if _is_enabled("FEATURE_DECISION_OUTCOME_LOOP"):
+        try:
+            linked_decisions = _close_open_decision_for_feedback(req.question, req.rating, req.comment)
+        except Exception as exc:
+            logger.warning("[feedback] decision-outcome link failed: %s", exc)
+
+    return {
+        "status": "ok",
+        "message": "Feedback recorded. Thank you.",
+        "decision_outcome_updates": linked_decisions,
+    }
 
 
 @app.get("/feedback/summary")
@@ -1388,7 +2312,7 @@ class AgenticRequest(BaseModel):
     question: str
     geography: str = "US"
     horizon: str = "MEDIUM_TERM"
-    response_mode: str = "detailed"
+    response_mode: str | None = None
     max_iterations: int = Field(default=2, ge=1, le=4)
     bloomberg_format: str = "morning_note"  # morning_note | risk_matrix | trade_idea | brief
 
@@ -1530,13 +2454,63 @@ async def intelligence_bloomberg(req: AgenticRequest, request: Request):
     }
 
 
-@app.get("/", response_class=FileResponse)
+@app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return FileResponse(
-        "api/static/index.html",
+    import os
+    import re
+    
+    with open("api/static/index.html", "r", encoding="utf-8") as f:
+        html = f.read()
+        
+    try:
+        mtime = int(os.path.getmtime("api/static/script.js"))
+    except Exception:
+        import time
+        mtime = int(time.time())
+        
+    html = re.sub(r'script\.js\?v=\d+', f'script.js?v={mtime}', html)
+    
+    return HTMLResponse(
+        content=html,
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
         }
     )
+
+# ── Admin Observability (V4.1) ────────────────────────────────────────────────
+
+@app.get("/api/admin/traces")
+@_rl("10/minute")
+async def get_admin_traces(request: Request):
+    """Return historical query traces for the Flow Dashboard."""
+    return JSONResponse(content=admin_logger.get_history())
+
+@app.get("/api/admin/health")
+@_rl("30/minute")
+async def get_system_health(request: Request):
+    """Return detailed system health and metrics."""
+    # Check simple dependencies
+    try:
+        from intelligence.context_retriever import check_index_exists
+        index_health = "UP" if check_index_exists() else "DOWN"
+    except ImportError:
+        index_health = "UNKNOWN"
+
+    summary = admin_logger.get_summary()
+    return JSONResponse(content={
+        "status": "HEALTHY",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": {
+            "api": "UP",
+            "vector_index": index_health,
+            "llm": "UP", # Assume UP if API is responding
+        },
+        **summary
+    })
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard():
+    """Serve the diagnostic dashboard UI."""
+    return FileResponse("api/static/admin.html")

@@ -46,8 +46,16 @@ QUESTION_TYPE_PATTERNS = {
     "COMMODITY": [
         r"\b(oil|gold|silver|copper|commodity|metal|energy|wti|brent|natural gas|agriculture)\b"
     ],
+    "CRYPTO": [
+        r"\b(crypto|bitcoin|btc|eth|ethereum|solana|sol|token|blockchain|defi|stablecoin)\b"
+    ],
+    "COMPANY": [
+        r"\b(company|corporate|ticker|quarterly|8-k|filing|expansion|merger|acquisition|ceo|cfo|management|msme|sme|small.?cap|mid.?cap|micro.?cap|earnings|guidance|outlook)\b",
+        r"\b(nvidia|tesla|microsoft|apple|google|alphabet|amazon|meta|metaverse|netflix|broadcom|amd|intel|tsmc|disney|boeing|air india|indigo)\b",
+        r"\b[A-Z]{3,5}\b"  # Tickers
+    ],
     "EQUITY": [
-        r"\b(stock|equity|market|s&p|nasdaq|valuation|pe ratio|earnings|sector|rally|sell.?off)\b"
+        r"\b(market|s&p|nasdaq|nifty|sensex|index|indices|valuation|pe ratio|sector|rally|sell.?off)\b"
     ],
 }
 
@@ -84,7 +92,12 @@ def classify_question(question: str) -> dict:
     detected_types = []
     for qtype, patterns in QUESTION_TYPE_PATTERNS.items():
         for pattern in patterns:
-            if re.search(pattern, q, re.IGNORECASE):
+            # Special case for Tickers: must be uppercase in original question
+            if pattern == r"\b[A-Z]{3,5}\b":
+                if re.search(pattern, question): # No IGNORECASE here
+                    detected_types.append(qtype)
+                    break
+            elif re.search(pattern, q, re.IGNORECASE):
                 detected_types.append(qtype)
                 break
 
@@ -114,7 +127,9 @@ def classify_question(question: str) -> dict:
         detected_types.append("DATA_PASTE")
 
     # Set analysis depth
-    is_broad = len(detected_types) >= 3 or "MULTI_FACTOR" in detected_types
+    has_msme = bool(re.search(r"\b(msme|sme|small.?cap|mid.?cap|micro.?cap)\b", q))
+    has_high_fidelity = any(t in detected_types for t in ["CRYPTO", "COMPANY", "CURRENCY"]) or has_msme
+    is_broad = len(detected_types) >= 3 or "MULTI_FACTOR" in detected_types or has_high_fidelity
     depth = "DEEP" if is_broad else "FOCUSED"
 
     return {
@@ -124,6 +139,7 @@ def classify_question(question: str) -> dict:
         "time_horizon": time_horizon,
         "contains_data": contains_data,
         "depth": depth,
+        "has_msme": has_msme,
     }
 
 
@@ -146,10 +162,15 @@ def get_emphasis_instruction(classification: dict) -> str:
         "CREDIT":        "Focus on credit cycle, leverage, spread dynamics, and contagion to equity.",
         "COMMODITY":     "Focus on supply/demand fundamentals, dollar impact, and commodity-linked sectors.",
         "EQUITY":        "Focus on earnings trajectory, valuation vs. rates, and factor rotation.",
+        "CRYPTO":        "Focus on risk-appetite correlation, dollar channel, and digital asset liquidity.",
+        "COMPANY":       "Focus on idiosyncratic drivers: expansion, earnings quality, and management guidance.",
         "MULTI_FACTOR":  "This is a broad macro question. Cover all major asset classes with equal depth.",
     }
 
     base = emphasis_map.get(ptype, "Analyze comprehensively.")
+    if classification.get("has_msme"):
+        base = "Analyze impact on MSMEs and small-cap firms separately from large MNCs. Focus on margin sensitivity and lack of hedging."
+
     return (
         f"FOCUS AREA: {ptype} | GEOGRAPHY: {geos} | HORIZON: {horizon} | DEPTH: {depth}\n"
         f"EMPHASIS: {base}"

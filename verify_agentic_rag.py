@@ -29,17 +29,12 @@ async def main():
         regime = {"regime": "RISK_OFF"}
         cross_asset = {"overall_signal": "BEARISH"}
         
-        output = formatter.morning_note(
+        output = formatter.brief(
             answer=answer_json,
-            indicators=indicators,
-            regime=regime,
-            cross_asset=cross_asset,
-            question=question,
-            geography="US",
-            horizon="MEDIUM_TERM"
+            question=question
         )
         print("\n" + "="*80)
-        print("BLOOMBERG TERMINAL OUTPUT:")
+        print("AGENT SYNTHESIS OUTPUT:")
         print("="*80 + "\n")
         print(output)
         print("\n" + "="*80)

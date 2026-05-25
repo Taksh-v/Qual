@@ -69,14 +69,18 @@ class QueryPlanner:
         return _call
 
     def _is_complex(self, question: str) -> bool:
-        """Heuristic: does the question contain multiple distinct concepts?"""
+        """
+        V5.0: Nearly all queries should be decomposed for broad coverage.
+        Only very short, single-word lookups are considered 'simple'.
+        """
         q_lower = question.lower()
+        # Always decompose if any complex signal is present
         for pattern in _COMPLEX_SIGNALS:
             if re.search(pattern, q_lower):
                 return True
-        # Word count heuristic: very long questions often span multiple topics
+        # V5.0: Lower threshold — decompose anything with 4+ words
         word_count = len(question.split())
-        return word_count >= 18
+        return word_count >= 4
 
     def _deterministic_decompose(self, question: str) -> list[str]:
         """
@@ -105,17 +109,19 @@ class QueryPlanner:
         return [question]
 
     def _llm_decompose(self, question: str) -> list[str]:
-        """Use LLM to intelligently decompose the query."""
+        """Use LLM to intelligently decompose the query into 3-5 focused sub-questions."""
         prompt = (
-            "You are a financial research planner. Break the following question into "
-            "2-4 focused, independent sub-questions that can each be answered separately "
-            "by retrieving relevant financial data.\n\n"
+            "You are a research planner for a financial intelligence engine. "
+            "Your job is to decompose the user's question into 3 to 5 specific, "
+            "independent sub-questions that can each be searched and answered separately.\n\n"
             "Rules:\n"
-            "1. Each sub-question must be self-contained (no pronouns like 'it', 'they').\n"
-            "2. Preserve all time references (e.g. 'last quarter', '2024').\n"
-            "3. Each sub-question must be directly answerable from financial data.\n"
-            "4. If the original question is simple and single-topic, return it unchanged.\n"
-            "5. Output ONLY the sub-questions, one per line, no numbering, no explanation.\n\n"
+            "1. You MUST produce at least 3 sub-questions. Maximum 5.\n"
+            "2. Each sub-question must be self-contained (no pronouns like 'it', 'they').\n"
+            "3. Preserve all time references (e.g. 'last quarter', '2024').\n"
+            "4. Each sub-question must be directly answerable from financial data or news.\n"
+            "5. Cover DIFFERENT ANGLES of the topic: macro, sector, geopolitical, company-level.\n"
+            "6. If the original question is simple, EXPAND it into related angles.\n"
+            "7. Output ONLY the sub-questions, one per line, no numbering, no explanation.\n\n"
             f"Question: {question}\n\n"
             "Sub-questions:"
         )
@@ -163,7 +169,7 @@ class QueryPlanner:
             logger.info(
                 "[QueryPlanner] LLM decomposed into %d sub-questions.", len(sub_qs)
             )
-            return sub_qs[:4]  # Cap at 4
+            return sub_qs[:5]  # Cap at 5 for deep research coverage
 
         # Fallback: deterministic split
         sub_qs = self._deterministic_decompose(question)

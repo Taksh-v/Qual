@@ -63,14 +63,26 @@ def main() -> int:
 
     steps_ok = _run_step(
         "Python compile check",
-        [sys.executable, "-m", "py_compile", "rag/query.py", "run_data_quality_audit.py", "run_rag_eval.py"],
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            "rag/query.py",
+            "run_data_quality_audit.py",
+            "run_rag_eval.py",
+            "ingestion/chunker.py",
+            "intelligence/data_quality.py",
+        ],
     ) and steps_ok
 
     if args.run_pytest:
         steps_ok = _run_step("Pytest", [sys.executable, "-m", "pytest", "-q"]) and steps_ok
 
     if not args.skip_audit:
-        steps_ok = _run_step("Data quality audit", [sys.executable, "run_data_quality_audit.py"]) and steps_ok
+        steps_ok = _run_step(
+            "Data quality audit",
+            [sys.executable, "run_data_quality_audit.py", "--strict"],
+        ) and steps_ok
 
     if not args.skip_rag_eval:
         ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")

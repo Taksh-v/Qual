@@ -1,18 +1,19 @@
 """
-intelligence/agentic_rag/orchestrator.py
------------------------------------------
-Main orchestration loop for the Bloomberg-grade Agentic RAG system.
+intelligence/agentic_rag/orchestrator_v2.py
+-------------------------------------------
+V7.0 Agent Orchestration Engine.
 
-Implements the Plan → Act → Observe → Reflect → Synthesize cycle:
+Migrated to a LangGraph-style StateMachineGraph architecture for infinite stability
+and true double-streaming support.
 
-  PLAN:     QueryPlanner decomposes the question into sub-questions
-  ACT:      Tools run in parallel (semantic search + live market data)
-  OBSERVE:  Specialist agents run in parallel, each producing a brief
-  REFLECT:  ReflectionEngine assesses gaps, generates follow-up queries
-  ITERATE:  If gaps exist and budget allows, go back to ACT with new queries
-  SYNTHESIZE: Final synthesis agent produces Bloomberg-grade output
+Nodes:
+  - planner
+  - searcher
+  - summarizer  
+  - critic
+  - synthesizer
 
-Each stage emits an AgentEvent (SSE-ready) so the UI can show progress.
+The orchestrated state machine yields AgentEvents asynchronously.
 """
 
 from __future__ import annotations
@@ -28,28 +29,23 @@ from .agent_state import AgentState, AgentOutput, ToolCall
 from .query_planner import QueryPlanner
 from .tool_registry import ToolRegistry, build_default_registry
 from .reflection_engine import ReflectionEngine
+from .state_machine import StateMachineGraph, END
+from intelligence.admin_logger import admin_logger
 
 logger = logging.getLogger(__name__)
 
-
-# ── Event types for SSE streaming ────────────────────────────────────────────
-
+# V5.0 Confidence threshold for filtering
+CONFIDENCE_THRESHOLD = 0.40
 
 @dataclass
 class AgentEvent:
-    """
-    Typed SSE event emitted by the orchestrator at each pipeline stage.
-    Can be serialized to JSON for Server-Sent Events.
-    """
-
-    stage: str  # planning | retrieval | agent_brief | reflection | synthesis | final | error
+    stage: str
     data: dict[str, Any] = field(default_factory=dict)
     agent_name: str = ""
     iteration: int = 0
     elapsed_ms: int = 0
 
     def to_sse(self) -> str:
-        """Serialize to SSE wire format."""
         payload = {
             "stage": self.stage,
             "agent_name": self.agent_name,
@@ -69,519 +65,274 @@ class AgentEvent:
         }
 
 
-# ── Specialist Agent Runners ──────────────────────────────────────────────────
-
-
-async def _run_macro_strategist(state: AgentState) -> AgentOutput:
-    """
-    MacroStrategist: Focuses on regime, yield curve, central bank signals.
-    Uses live indicators + retrieved macro context.
-    """
-    t0 = time.time()
-    agent_name = "MacroStrategist"
-
-    macro_context = "\n".join(
-        c.get("text", "")
-        for c in state.retrieved_chunks
-        if "macro" in (c.get("metadata", {}).get("data_type") or "").lower()
-    )[:800] or "\n".join(c.get("text", "")[:200] for c in state.retrieved_chunks[:3])
-
-    indicators_str = ", ".join(
-        f"{k}={v:.2f}" for k, v in list(state.live_indicators.items())[:12]
-    ) or "No live data available."
-
-    prompt = (
-        "You are the head of global macro strategy at a top-tier investment bank.\n"
-        "Your job: assess the macro regime and its implications for the user's question.\n\n"
-        f"QUESTION: {state.question}\n\n"
-        f"LIVE INDICATORS:\n{indicators_str}\n\n"
-        f"MACRO CONTEXT (from indexed research):\n{macro_context[:700]}\n\n"
-        "Write a concise macro brief (150-200 words) covering:\n"
-        "1. Current regime assessment (e.g. late-cycle, stagflation risk, reflation)\n"
-        "2. Key macro driver for this question (with 1-2 data points)\n"
-        "3. Rate/yield curve signal and its transmission mechanism\n"
-        "4. Confidence level: HIGH/MEDIUM/LOW and why\n"
-        "Be specific with numbers. No fluff."
-    )
-
-    try:
-        from intelligence.llm_provider import generate_text
-        brief, _ = generate_text(prompt, temperature=0.1, max_tokens=350, timeout_sec=45.0)
-        confidence = 0.75 if any(kw in brief.lower() for kw in ["rate", "yield", "inflation", "gdp"]) else 0.50
-        citations = [f"[S{i+1}]" for i in range(min(len(state.retrieved_chunks), 3))]
-    except Exception as exc:
-        logger.warning("[MacroStrategist] LLM failed: %s", exc)
-        brief = f"Macro analysis unavailable: {exc}"
-        confidence = 0.0
-        citations = []
-
-    return AgentOutput(
-        agent_name=agent_name,
-        brief=brief,
-        confidence=confidence,
-        evidence_citations=citations,
-        elapsed_ms=int((time.time() - t0) * 1000),
-    )
-
-
-async def _run_sentiment_analyst(state: AgentState) -> AgentOutput:
-    """
-    SentimentAnalyst: Reads news/SEC sentiment, insider signals, earnings tone.
-    """
-    t0 = time.time()
-    agent_name = "SentimentAnalyst"
-
-    news_chunks = [
-        c for c in state.retrieved_chunks
-        if (c.get("metadata", {}).get("data_type") or "").lower() in ("news", "sec", "earnings_transcript")
-    ][:5]
-    if not news_chunks:
-        news_chunks = state.retrieved_chunks[:4]
-
-    news_text = "\n\n".join(
-        f"[S{i+1}] {c.get('metadata', {}).get('title', 'Untitled')} | "
-        f"{c.get('metadata', {}).get('source', '')} | "
-        f"{c.get('metadata', {}).get('date', '')}\n{c.get('text', '')[:250]}"
-        for i, c in enumerate(news_chunks)
-    ) or "No news context retrieved."
-
-    prompt = (
-        "You are a behavioral finance and sentiment analyst.\n"
-        "Assess the qualitative sentiment signals relevant to the user's question.\n\n"
-        f"QUESTION: {state.question}\n\n"
-        f"NEWS & FILINGS CONTEXT:\n{news_text}\n\n"
-        "Write a focused sentiment brief (100-150 words) covering:\n"
-        "1. Overall sentiment direction (bullish/bearish/neutral/mixed) with evidence\n"
-        "2. Key narrative driving markets/media coverage\n"
-        "3. Any contradictions (e.g. positive headlines but negative flow data)\n"
-        "4. Sentiment momentum: is it accelerating or fading?\n"
-        "Cite sources as [S1], [S2] etc. Be specific."
-    )
-
-    try:
-        from intelligence.llm_provider import generate_text
-        brief, _ = generate_text(prompt, temperature=0.1, max_tokens=300, timeout_sec=40.0)
-        citations = [f"[S{i+1}]" for i in range(len(news_chunks))]
-        confidence = 0.70 if news_chunks else 0.30
-    except Exception as exc:
-        logger.warning("[SentimentAnalyst] LLM failed: %s", exc)
-        brief = f"Sentiment analysis unavailable: {exc}"
-        confidence = 0.0
-        citations = []
-
-    return AgentOutput(
-        agent_name=agent_name,
-        brief=brief,
-        confidence=confidence,
-        evidence_citations=citations,
-        elapsed_ms=int((time.time() - t0) * 1000),
-    )
-
-
-async def _run_risk_analyst(state: AgentState) -> AgentOutput:
-    """
-    RiskAnalyst: Focuses on tail risks, volatility, and probability-weighted scenarios.
-    """
-    t0 = time.time()
-    agent_name = "RiskAnalyst"
-
-    indicators_str = ", ".join(
-        f"{k}={v:.2f}" for k, v in list(state.live_indicators.items())[:10]
-    ) or "No live indicators."
-
-    prompt = (
-        "You are the chief risk officer at a global macro hedge fund.\n"
-        "Provide a risk-focused analysis for the following question.\n\n"
-        f"QUESTION: {state.question}\n\n"
-        f"MARKET INDICATORS:\n{indicators_str}\n\n"
-        "Write a risk brief (120-180 words) covering:\n"
-        "- Base case (~55%): Most likely outcome with key catalyst\n"
-        "- Bull case (~25%): Upside trigger and magnitude\n"
-        "- Bear case (~20%): Tail risk trigger and severity\n"
-        "- Top 2 risk factors to monitor (with specific levels/triggers)\n"
-        "Use actual probabilities. Be direct. No hedging."
-    )
-
-    try:
-        from intelligence.llm_provider import generate_text
-        brief, _ = generate_text(prompt, temperature=0.15, max_tokens=320, timeout_sec=40.0)
-        confidence = 0.65
-        # Boost confidence if scenarios present
-        if "base" in brief.lower() and ("bull" in brief.lower() or "bear" in brief.lower()):
-            confidence = 0.80
-    except Exception as exc:
-        logger.warning("[RiskAnalyst] LLM failed: %s", exc)
-        brief = f"Risk analysis unavailable: {exc}"
-        confidence = 0.0
-
-    return AgentOutput(
-        agent_name=agent_name,
-        brief=brief,
-        confidence=confidence,
-        elapsed_ms=int((time.time() - t0) * 1000),
-    )
-
-
-async def _run_technical_analyst(state: AgentState) -> AgentOutput:
-    """
-    TechnicalAnalyst: Reads momentum signals from VIX, DXY, yield curve, spreads.
-    """
-    t0 = time.time()
-    agent_name = "TechnicalAnalyst"
-
-    technical_indicators = {
-        k: v for k, v in state.live_indicators.items()
-        if k in ("vix", "dxy", "yield_10y", "yield_2y", "yield_curve", "sp500", "credit_hy", "oil_wti", "gold")
-    }
-    ind_str = ", ".join(f"{k}={v:.2f}" for k, v in technical_indicators.items()) or "No technical data."
-
-    prompt = (
-        "You are a quantitative technical analyst at a systematic trading desk.\n"
-        "Assess momentum, positioning, and technical signals for the user's question.\n\n"
-        f"QUESTION: {state.question}\n\n"
-        f"TECHNICAL INDICATORS:\n{ind_str}\n\n"
-        "Write a technical brief (100-150 words) covering:\n"
-        "1. Key momentum signal from the most relevant indicator\n"
-        "2. VIX/vol regime: Is fear elevated or suppressed?\n"
-        "3. Dollar trend and its cross-asset implications\n"
-        "4. One specific level to watch (with price/rate level)\n"
-        "Be quantitative. State direction clearly: bullish/bearish/neutral."
-    )
-
-    try:
-        from intelligence.llm_provider import generate_text
-        brief, _ = generate_text(prompt, temperature=0.05, max_tokens=280, timeout_sec=35.0)
-        confidence = 0.65 if technical_indicators else 0.30
-    except Exception as exc:
-        logger.warning("[TechnicalAnalyst] LLM failed: %s", exc)
-        brief = f"Technical analysis unavailable: {exc}"
-        confidence = 0.0
-
-    return AgentOutput(
-        agent_name=agent_name,
-        brief=brief,
-        confidence=confidence,
-        elapsed_ms=int((time.time() - t0) * 1000),
-    )
-
-
-def _run_synthesis_agent_stream(state: AgentState):
-    """
-    SynthesisAgent (Head Macro Strategist): Synthesizes all agent briefs into a
-    conversational Markdown final analysis. Yields tokens.
-    """
-    agent_briefs = "\n\n".join(
-        f"--- {ao.agent_name} (confidence: {ao.confidence:.0%}) ---\n{ao.brief}"
-        for ao in state.agent_outputs
-        if ao.brief and "unavailable" not in ao.brief.lower()
-    ) or "No agent briefs available."
-
-    indicators_str = ", ".join(
-        f"{k}={v:.2f}" for k, v in list(state.live_indicators.items())[:12]
-    ) or "No live data."
-
-    sources_str = "\n".join(
-        f"[S{i+1}] {c.get('metadata', {}).get('title', 'Untitled')} | "
-        f"{c.get('metadata', {}).get('source', '')} | "
-        f"{c.get('metadata', {}).get('date', '')}"
-        for i, c in enumerate(state.retrieved_chunks[:8])
-    ) or "No sources available."
-
-    from intelligence.prompt_templates import CONVERSATIONAL_SYNTHESIS_TEMPLATE
-    prompt = CONVERSATIONAL_SYNTHESIS_TEMPLATE.format(
-        question=state.question,
-        geography=state.geography,
-        horizon=state.horizon,
-        indicators_str=indicators_str,
-        agent_briefs=agent_briefs,
-        sources_str=sources_str
-    )
-
-    try:
-        from intelligence.llm_provider import generate_text_stream
-        return generate_text_stream(prompt, temperature=0.20, max_tokens=1500, timeout_sec=120.0)
-    except Exception as exc:
-        logger.error("[SynthesisAgent] LLM failed: %s", exc)
-        def fallback():
-            yield f"Synthesis unavailable: {exc}"
-        return fallback()
-
-
-# ── Main Orchestrator ─────────────────────────────────────────────────────────
-
-
 class AgenticOrchestrator:
-    """
-    Bloomberg-grade Agentic RAG Orchestrator.
-
-    Implements the full Plan → Act → Observe → Reflect → Synthesize loop.
-    Each stage emits AgentEvent objects for real-time SSE streaming.
-
-    Usage:
-        orchestrator = AgenticOrchestrator()
-        async for event in orchestrator.run_async(question, ...):
-            yield event.to_sse()
-    """
-
-    def __init__(
-        self,
-        max_iterations: int = 2,
-        registry: ToolRegistry | None = None,
-    ) -> None:
+    def __init__(self, max_iterations: int = 2, registry: ToolRegistry | None = None) -> None:
         self.max_iterations = max_iterations
         self.registry = registry or build_default_registry()
         self.planner = QueryPlanner()
         self.reflection = ReflectionEngine()
+        self.graph = self._build_graph()
 
-    async def run_async(
-        self,
-        question: str,
-        geography: str = "US",
-        horizon: str = "MEDIUM_TERM",
-        response_mode: str = "detailed",
-    ) -> AsyncIterator[AgentEvent]:
-        """
-        Run the full agentic pipeline asynchronously, yielding events as they occur.
+    def _build_graph(self) -> StateMachineGraph:
+        graph = StateMachineGraph()
+        
+        graph.add_node("planner", self._node_planner)
+        graph.add_node("searcher", self._node_searcher)
+        graph.add_node("summarizer", self._node_summarizer)
+        graph.add_node("critic", self._node_critic)
+        graph.add_node("synthesizer", self._node_synthesizer)
+        graph.add_node("audit", self._node_audit)
+        graph.add_node("learn", self._node_learn)
 
-        Yields AgentEvent objects at each pipeline stage.
-        Final event (stage='final') contains the complete structured output.
-        """
-        state = AgentState(
-            question=question,
-            geography=geography,
-            horizon=horizon,
-            response_mode=response_mode,
-            max_iterations=self.max_iterations,
-        )
-        state.mark_stage("start")
-        overall_start = time.time()
+        graph.set_entry_point("planner")
+        
+        graph.add_edge("planner", "searcher")
+        graph.add_edge("searcher", "summarizer")
+        graph.add_edge("summarizer", "critic")
+        
+        def critic_router(state: AgentState) -> str:
+            # If no context gaps or max iterations reached, move to synthesizer
+            if not state.gaps or state.iteration >= state.max_iterations:
+                return "synthesizer"
+            return "searcher"
 
-        # ── STAGE 1: PLAN ────────────────────────────────────────────────────
-        yield AgentEvent(
-            stage="planning",
-            data={"message": "Decomposing query into sub-questions..."},
-            elapsed_ms=state.elapsed_ms(),
-        )
+        graph.add_conditional_edges("critic", critic_router, {
+            "searcher": "searcher",
+            "synthesizer": "synthesizer"
+        })
+        
+        graph.add_edge("synthesizer", "audit")
+
+        def audit_router(state: AgentState) -> str:
+            # If final audit fails and we have iterations left, try fixing it
+            if state.gaps and state.iteration < state.max_iterations:
+                return "searcher"
+            # If audit passes, proceed to learning (Phase 5) before ending
+            return "learn"
+
+        graph.add_conditional_edges("audit", audit_router, {
+            "searcher": "searcher",
+            "learn": "learn"
+        })
+        
+        graph.add_edge("learn", END)
+        return graph
+
+    # ── GRAPH NODES ───
+    
+    async def _node_planner(self, state: AgentState) -> AsyncIterator[AgentEvent]:
+        state.mark_stage("planning")
+        yield AgentEvent(stage="planning", data={"message": "Decomposing query into focused sub-questions..."}, elapsed_ms=state.elapsed_ms())
+        
+        trace_id = admin_logger.start_trace(state.question)
+        state.trace_id = trace_id # Storing temporarily in state if needed or we use a weakref 
+
         try:
-            sub_qs = await asyncio.get_event_loop().run_in_executor(
-                None, self.planner.decompose, question
-            )
+            sub_qs = await asyncio.get_event_loop().run_in_executor(None, self.planner.decompose, state.question)
             state.sub_questions = sub_qs
         except Exception as exc:
-            state.sub_questions = [question]
-            logger.warning("[Orchestrator] Planning failed: %s", exc)
+            state.sub_questions = [state.question]
+            logger.warning("[Orchestrator] Planning failed, using original query: %s", exc)
 
-        state.mark_stage("planning")
-        yield AgentEvent(
-            stage="planning",
-            data={"sub_questions": state.sub_questions, "count": len(state.sub_questions)},
-            elapsed_ms=state.elapsed_ms(),
-        )
+        yield AgentEvent(stage="planning", data={"sub_questions": state.sub_questions, "count": len(state.sub_questions)}, elapsed_ms=state.elapsed_ms())
 
-        # ── STAGE 2: ACT — Parallel tool calls ──────────────────────────────
-        await self._act_phase(state)
-        state.mark_stage("retrieval")
-        yield AgentEvent(
-            stage="retrieval",
-            data={
-                "chunks_retrieved": len(state.retrieved_chunks),
-                "indicators_fetched": len(state.live_indicators),
-                "message": f"Retrieved {len(state.retrieved_chunks)} context chunks + {len(state.live_indicators)} indicators",
-            },
-            elapsed_ms=state.elapsed_ms(),
-        )
-
-        # ── STAGE 3: OBSERVE — Run specialist agents in parallel ─────────────
-        yield AgentEvent(
-            stage="agent_start",
-            data={"message": "Running specialist agents in parallel..."},
-            elapsed_ms=state.elapsed_ms(),
-        )
-        await self._observe_phase(state)
-        state.mark_stage("agents")
-
-        for ao in state.agent_outputs:
-            yield AgentEvent(
-                stage="agent_brief",
-                agent_name=ao.agent_name,
-                data={
-                    "brief": ao.brief[:400],  # Truncate for SSE
-                    "confidence": ao.confidence,
-                    "elapsed_ms": ao.elapsed_ms,
-                },
-                iteration=state.iteration,
-                elapsed_ms=state.elapsed_ms(),
-            )
-
-        # ── STAGE 4: SYNTHESIZE (first pass) ────────────────────────────────
-        yield AgentEvent(
-            stage="synthesis",
-            data={"message": "Synthesizing agent briefs..."},
-            elapsed_ms=state.elapsed_ms(),
-        )
+    async def _node_searcher(self, state: AgentState) -> AsyncIterator[AgentEvent]:
+        state.mark_stage("search")
         
-        stream_gen = _run_synthesis_agent_stream(state)
-        loop = asyncio.get_event_loop()
-        def get_next(gen):
-            try:
-                return next(gen)
-            except StopIteration:
-                return None
-                
-        draft_text = ""
-        while True:
-            token = await loop.run_in_executor(None, get_next, stream_gen)
-            if token is None:
-                break
-            draft_text += token
-            yield AgentEvent(stage="token", data={"text": token}, elapsed_ms=state.elapsed_ms())
-            
-        state.draft_answer = draft_text
-        state.mark_stage("first_synthesis")
-
-        # ── STAGE 5: REFLECT → ITERATE if needed ────────────────────────────
-        while not state.is_complete():
-            state.iteration += 1
-            gaps = self.reflection.assess_gaps(state)
-            state.gaps = gaps
-
-            yield AgentEvent(
-                stage="reflection",
-                iteration=state.iteration,
-                data={
-                    "gaps": gaps,
-                    "should_iterate": bool(gaps),
-                    "iteration": state.iteration,
-                },
-                elapsed_ms=state.elapsed_ms(),
-            )
-
-            if not gaps:
-                logger.info("[Orchestrator] No gaps found. Terminating loop.")
-                break
-
-            # Generate gap-targeted queries
-            gap_queries = self.reflection.generate_follow_up_queries(gaps, question)
-            state.gap_queries = gap_queries
-
-            if not self.reflection.should_iterate(state):
-                break
-
-            # Additional retrieval for gaps
-            yield AgentEvent(
-                stage="gap_retrieval",
-                iteration=state.iteration,
-                data={"gap_queries": gap_queries, "message": f"Filling {len(gaps)} gaps..."},
-                elapsed_ms=state.elapsed_ms(),
-            )
-            await self._act_phase(state, queries=gap_queries)
-
-            # Re-synthesize with enriched context
-            stream_gen = _run_synthesis_agent_stream(state)
-            draft_text = ""
-            while True:
-                token = await loop.run_in_executor(None, get_next, stream_gen)
-                if token is None:
-                    break
-                draft_text += token
-                yield AgentEvent(stage="token", data={"text": token}, elapsed_ms=state.elapsed_ms())
-            
-            state.draft_answer = draft_text
-            state.mark_stage(f"synthesis_iter_{state.iteration}")
-
-        state.final_answer = state.draft_answer
-        state.complete = True
-
-        # ── FINAL EVENT ──────────────────────────────────────────────────────
-        agreeing, total = state.agent_agreement_score()
-        from intelligence.bloomberg_formatter import BloombergFormatter
-        formatter = BloombergFormatter()
-
-        state.mark_stage("complete")
-        yield AgentEvent(
-            stage="final",
-            data={
-                "question": question,
-                "answer": state.final_answer,
-                "sources": [
-                    {
-                        "title": c.get("metadata", {}).get("title", "Unknown"),
-                        "source": c.get("metadata", {}).get("source", ""),
-                        "date": c.get("metadata", {}).get("date", ""),
-                    }
-                    for c in state.retrieved_chunks[:8]
-                ],
-                "agent_agreement": f"{agreeing}/{total}",
-                "iterations": state.iteration,
-                "live_indicators_count": len(state.live_indicators),
-                "chunks_used": len(state.retrieved_chunks),
-                "sub_questions": state.sub_questions,
-                "gaps_found": state.gaps,
-                "trace": state.to_trace(),
-                "elapsed_ms": state.elapsed_ms(),
-            },
-            elapsed_ms=state.elapsed_ms(),
-        )
-
-    async def _act_phase(
-        self,
-        state: AgentState,
-        queries: list[str] | None = None,
-    ) -> None:
-        """
-        Parallel tool execution phase (ACT).
-        Runs semantic search (for each query) and live market fetch concurrently.
-        """
-        search_tool = self.registry.get("semantic_search")
-        live_tool = self.registry.get("live_market")
-        cross_tool = self.registry.get("cross_asset")
-
-        search_queries = queries or state.sub_questions or [state.question]
-
-        async def _search(q: str) -> None:
-            if search_tool:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, search_tool.run, q
-                )
-                state.tool_calls.append(ToolCall("semantic_search", q, state.iteration, None))
-                if result.success and result.data:
-                    state.add_observation(result.data)
-
-        async def _live_market() -> None:
-            if live_tool and not state.live_indicators:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, live_tool.run, ""
-                )
-                if result.success and result.data:
-                    state.live_indicators = result.data.get("indicators", {})
-                    state.live_meta = result.data.get("meta", {})
-
-        async def _cross_asset() -> None:
+        # If it's the first iteration, we search standard sub_qs.
+        # If >0 iteration, we search gap_queries.
+        queries_to_search = state.sub_questions if state.iteration == 0 else state.gap_queries
+        
+        yield AgentEvent(stage="search", data={"message": f"Dispatching Search Agents for {len(queries_to_search)} queries (Iteration {state.iteration})..."}, elapsed_ms=state.elapsed_ms())
+        
+        from intelligence.analyst_agents import run_search_agent, run_web_search_agent
+        
+        # Determine fallback logic - use web search directly for gap queries (iter > 0)
+        # because the internal index already failed to provide sufficient data.
+        if state.iteration > 0:
+            yield AgentEvent(stage="search", data={"message": f"Aggressive Web Search for {len(queries_to_search)} context gaps..."}, elapsed_ms=state.elapsed_ms())
+            search_tasks = [run_web_search_agent(q, self.registry) for q in queries_to_search]
+        else:
+            search_tasks = [run_search_agent(q, self.registry) for q in queries_to_search]
+        
+        # Also fetch live market data concurrently on first iteration
+        async def _fetch_live() -> None:
+            if state.iteration > 0: return
+            live_tool = self.registry.get("live_market")
+            cross_tool = self.registry.get("cross_asset")
+            if live_tool:
+                try:
+                    res = await asyncio.get_event_loop().run_in_executor(None, live_tool.run, "")
+                    if res.success and res.data:
+                        state.live_indicators = res.data.get("indicators", {})
+                except: pass
             if cross_tool and state.live_indicators:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: cross_tool.run("", indicators=state.live_indicators)
+                try:
+                    res2 = await asyncio.get_event_loop().run_in_executor(None, lambda: cross_tool.run("", indicators=state.live_indicators))
+                    if res2.success:
+                        state.live_meta["cross_asset"] = res2.data
+                except: pass
+
+        all_results = await asyncio.gather(*search_tasks, _fetch_live(), return_exceptions=True)
+        search_outputs = []
+        for r in all_results[:-1]:
+            if isinstance(r, AgentOutput):
+                search_outputs.append(r)
+                state.add_agent_output(r)  # Cumulative accumulation
+                
+        # Handle CRAG fallbacks directly in Searcher node
+        failed_qs = [s.sub_query for s in search_outputs if s.status != "success" or s.confidence < CONFIDENCE_THRESHOLD]
+        valid_search = [s for s in search_outputs if s.status == "success" and s.confidence >= CONFIDENCE_THRESHOLD]
+        
+        if failed_qs:
+            yield AgentEvent(stage="search", data={"message": f"Triggering Web Fallback for {len(failed_qs)} sparse queries..."}, elapsed_ms=state.elapsed_ms())
+            web_results = await asyncio.gather(*[run_web_search_agent(q, self.registry) for q in failed_qs], return_exceptions=True)
+            for r in web_results:
+                if isinstance(r, AgentOutput) and r.status == "success":
+                    valid_search.append(r)
+                    state.add_agent_output(r) # Cumulative accumulation
+
+        state.current_valid_search = valid_search
+        yield AgentEvent(stage="filter", data={"message": f"Confidence filter: {len(valid_search)} passed."}, elapsed_ms=state.elapsed_ms())
+
+    async def _node_summarizer(self, state: AgentState) -> AsyncIterator[AgentEvent]:
+        state.mark_stage("summarize")
+        valid_search = getattr(state, "current_valid_search", [])
+        if not valid_search:
+            yield AgentEvent(stage="summarize", data={"message": "No valid search results to summarize.", "total": 0}, elapsed_ms=state.elapsed_ms())
+            return
+            
+        yield AgentEvent(stage="summarize", data={"message": f"Dispatching {len(valid_search)} Summarizer Agents..."}, elapsed_ms=state.elapsed_ms())
+        
+        from intelligence.analyst_agents import run_summarizer_agent
+        summarize_tasks = [
+            run_summarizer_agent(raw_text=s.brief, original_query=state.question, sub_query=s.sub_query)
+            for s in valid_search
+        ]
+        
+        summary_results = await asyncio.gather(*summarize_tasks, return_exceptions=True)
+        for r in summary_results:
+            if isinstance(r, AgentOutput) and r.status == "success" and r.confidence >= CONFIDENCE_THRESHOLD:
+                state.add_agent_output(r)
+                state.valid_summaries.append(r)
+
+        yield AgentEvent(stage="integrity", data={"message": f"Integrity check: accumulated {len(state.valid_summaries)} valid summaries.", "valid_summaries": len(state.valid_summaries)}, elapsed_ms=state.elapsed_ms())
+
+    async def _node_critic(self, state: AgentState) -> AsyncIterator[AgentEvent]:
+        # Form context from ALL valid summaries so far
+        context_text = "\\n".join([s.brief for s in state.valid_summaries])
+
+        if state.iteration < state.max_iterations - 1:
+            yield AgentEvent(stage="reflection", data={"message": f"Assessing context for missing info (iteration {state.iteration + 1}/{self.max_iterations})..."}, elapsed_ms=state.elapsed_ms())
+
+            try:
+                reflection_gaps = await asyncio.get_event_loop().run_in_executor(
+                    None, self.reflection.assess_context_gaps, context_text, state.question, state.iteration
                 )
-                if result.success:
-                    state.live_meta["cross_asset"] = result.data
+            except Exception as exc:
+                logger.warning("[Orchestrator] Reflection failed: %s", exc)
+                reflection_gaps = []
 
-        # Run all searches + live market fetch in parallel
-        tasks = [_search(q) for q in search_queries] + [_live_market(), _cross_asset()]
-        await asyncio.gather(*tasks, return_exceptions=True)
+            state.gaps = reflection_gaps
+            if reflection_gaps:
+                yield AgentEvent(stage="correction", data={"message": f"Context Gaps Detected: {reflection_gaps}. Routing back to Search..."}, elapsed_ms=state.elapsed_ms())
+                gap_queries = await asyncio.get_event_loop().run_in_executor(
+                    None, self.reflection.generate_follow_up_queries, reflection_gaps, state.question
+                )
+                state.gap_queries = gap_queries
+                # Incrementing moved to router or loop detection logic elsewhere, 
+                # but we'll increment HERE to track the 'attempt'
+                state.iteration += 1
+            else:
+                yield AgentEvent(stage="reflection", data={"message": "Context is complete. Proceeding to synthesis."}, elapsed_ms=state.elapsed_ms())
 
-    async def _observe_phase(self, state: AgentState) -> None:
-        """
-        Parallel specialist agent execution phase (OBSERVE).
-        Runs all four agents concurrently via asyncio.gather.
-        """
-        results = await asyncio.gather(
-            _run_macro_strategist(state),
-            _run_sentiment_analyst(state),
-            _run_risk_analyst(state),
-            _run_technical_analyst(state),
-            return_exceptions=True,
-        )
-        for result in results:
-            if isinstance(result, AgentOutput):
-                state.add_agent_output(result)
-            elif isinstance(result, Exception):
-                logger.warning("[Orchestrator] Agent failed: %s", result)
+    async def _node_synthesizer(self, state: AgentState) -> AsyncIterator[AgentEvent]:
+        yield AgentEvent(stage="synthesis", data={"message": "Formulating final report (Streaming)..."}, elapsed_ms=state.elapsed_ms())
+
+        from intelligence.analyst_agents import run_analyst_agent_stream
+        final_answer_chunks = []
+        
+        async for token in run_analyst_agent_stream(
+            summaries=state.valid_summaries,
+            data_gaps=state.gaps,
+            original_query=state.question,
+            live_indicators=state.live_indicators,
+            geography=state.geography,
+            horizon=state.horizon,
+            conversation_context=state.conversation_context,
+        ):
+            final_answer_chunks.append(token)
+            yield AgentEvent(stage="token", data={"text": token}, elapsed_ms=state.elapsed_ms())
+
+        state.final_answer = "".join(final_answer_chunks)
+        state.complete = True
+        state.mark_stage("synthesis")
+
+    async def _node_audit(self, state: AgentState) -> AsyncIterator[AgentEvent]:
+        # Perform a deeper institutional audit on the final synthesized report
+        if not state.final_answer or len(state.final_answer) < 100:
+            return
+
+        yield AgentEvent(stage="audit", data={"message": "Institutional Critic auditing final report for precision and logic..."}, elapsed_ms=state.elapsed_ms())
+        
+        try:
+            audit_gaps = await asyncio.get_event_loop().run_in_executor(
+                None, self.reflection.assess_gaps, state
+            )
+            state.gaps = audit_gaps
+            if audit_gaps:
+                yield AgentEvent(stage="correction", data={"message": f"Analytical Gaps Found in Draft: {audit_gaps}. Triggering corrective search..."}, elapsed_ms=state.elapsed_ms())
+                gap_queries = await asyncio.get_event_loop().run_in_executor(
+                    None, self.reflection.generate_follow_up_queries, audit_gaps, state.question
+                )
+                state.gap_queries = gap_queries
+                state.iteration += 1
+            else:
+                yield AgentEvent(stage="audit", data={"message": "Audit PASSED. Final report verified."}, elapsed_ms=state.elapsed_ms())
+        except Exception as exc:
+            logger.warning("[Orchestrator] Audit failed: %s", exc)
+
+    async def _node_learn(self, state: AgentState) -> AsyncIterator[AgentEvent]:
+        # PHASE 5: Persistent Learning
+        # Ingest verified web results into permanent memory
+        yield AgentEvent(stage="learning", data={"message": "Active Learner committing research to Institutional Memory..."}, elapsed_ms=state.elapsed_ms())
+        
+        try:
+            from intelligence.agentic_rag.active_learner import get_learner
+            learner = get_learner()
+            
+            # Use results from WebSearchAgent that were successful and not already from memory
+            web_results = [
+                o for o in state.agent_outputs 
+                if o.agent_name == "WebSearchAgent" and o.status == "success" and "Institutional Memory" not in o.brief
+            ]
+            
+            num_learned = await learner.learn_from_outputs(web_results, state.question)
+            if num_learned:
+                yield AgentEvent(stage="learning", data={"message": f"Successfully learned {num_learned} new concepts. Memory updated."}, elapsed_ms=state.elapsed_ms())
+            else:
+                yield AgentEvent(stage="learning", data={"message": "No new significant concepts found to ingest."}, elapsed_ms=state.elapsed_ms())
+        except Exception as exc:
+            logger.error("[Orchestrator] Learning failed: %s", exc)
+
+    async def run_async(self, question: str, geography: str = "US", horizon: str = "MEDIUM_TERM", response_mode: str = "detailed", session_id: str = "") -> AsyncIterator[AgentEvent]:
+        # Entry point wrapper
+        state = AgentState(question=question, geography=geography, horizon=horizon, response_mode=response_mode, max_iterations=self.max_iterations)
+        state.mark_stage("start")
+
+        if session_id:
+            from intelligence.session_memory import get_conversation_context
+            state.conversation_context = get_conversation_context(session_id)
+
+        # Run the LangGraph-style state machine and yield any emitted events
+        async for event in self.graph.run_async(state):
+            yield event
+
+        # Post-loop
+        if session_id:
+            from intelligence.session_memory import record_turn
+            record_turn(session_id, question, state.final_answer)
+
+        # Ensure we increment state iteration inside the loop or end of loop
+        # Wait, the graph doesn't auto-increment iteration.
+        # We must increment iteration before entering searcher again.

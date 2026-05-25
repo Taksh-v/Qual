@@ -205,10 +205,67 @@ def _content_fingerprint(text: str) -> str:
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
 
 
+def _is_heading_line(line: str) -> bool:
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return True
+    if stripped.endswith(":") and len(stripped) <= 80:
+        return True
+    words = stripped.split()
+    if 1 <= len(words) <= 10 and stripped.upper() == stripped and any(ch.isalpha() for ch in stripped):
+        return True
+    return False
+
+
+def _semantic_units(text: str) -> list[str]:
+    raw = (text or "").replace("\r\n", "\n")
+    if not raw.strip():
+        return []
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n+", raw) if b.strip()]
+    if len(blocks) <= 1:
+        return [s.strip() for s in sent_tokenize(raw) if s.strip()]
+
+    units: list[str] = []
+    pending_heading: str | None = None
+    for block in blocks:
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if len(lines) == 1 and _is_heading_line(lines[0]):
+            pending_heading = lines[0]
+            continue
+        merged = " ".join(lines)
+        if pending_heading:
+            merged = f"{pending_heading} {merged}"
+            pending_heading = None
+        units.append(merged)
+
+    if pending_heading:
+        units.append(pending_heading)
+    return units or [s.strip() for s in sent_tokenize(raw) if s.strip()]
+
+
+def _overlap_tail(units: list[str], overlap_chars: int) -> list[str]:
+    if not units or overlap_chars <= 0:
+        return []
+    acc: list[str] = []
+    total = 0
+    for part in reversed(units):
+        acc.insert(0, part)
+        total += len(part)
+        if total >= overlap_chars:
+            break
+    return acc
+
+
 def chunk_text(
     text: str,
     chunk_size: int = 2000,
     overlap: int = 250,
+    semantic_mode: bool = True,
     with_metadata: bool = False,
     extra_metadata: dict[str, Any] | None = None,
 ):
@@ -232,19 +289,19 @@ def chunk_text(
     Returns:
         ``list[str]`` when *with_metadata* is False; ``list[dict]`` otherwise.
     """
-    sentences = sent_tokenize(text)
+    units = _semantic_units(text) if semantic_mode else [s.strip() for s in sent_tokenize(text) if s.strip()]
     raw_chunks: list[str] = []
     seen_fingerprints: set[str] = set()  # dedup within same article
 
     current_chunk: list[str] = []
     current_length = 0
 
-    for sentence in sentences:
-        sentence_length = len(sentence)
+    for unit in units:
+        unit_length = len(unit)
 
-        if current_length + sentence_length <= chunk_size:
-            current_chunk.append(sentence)
-            current_length += sentence_length
+        if current_length + unit_length <= chunk_size:
+            current_chunk.append(unit)
+            current_length += unit_length
         else:
             chunk_body = " ".join(current_chunk)
             fp = _content_fingerprint(chunk_body)
@@ -252,11 +309,10 @@ def chunk_text(
                 seen_fingerprints.add(fp)
                 raw_chunks.append(chunk_body)
 
-            # overlap
-            overlap_sentences = current_chunk[-3:] if len(current_chunk) > 3 else current_chunk
+            overlap_units = _overlap_tail(current_chunk, overlap)
             current_chunk = []
-            current_chunk.extend(overlap_sentences)
-            current_chunk.append(sentence)
+            current_chunk.extend(overlap_units)
+            current_chunk.append(unit)
             current_length = sum(len(s) for s in current_chunk)
 
     if current_chunk:

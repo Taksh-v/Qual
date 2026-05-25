@@ -14,6 +14,8 @@ This guide defines the institutional-quality writing standards for the Macro AI 
 - Use the canonical headers defined in `response_contract_v2.md`.
 - Use bullet points (`- `) for lists.
 - Avoid nested bullet points.
+- Advanced payload blocks (`evidence_integrity`, `regime_warning`, `decision_stub`, `counterfactual_result`, `personalization`) are optional metadata and must not replace core narrative sections.
+- If advanced blocks are emitted, keep values concise and machine-parseable so both top-level payload and `_response_contract` metadata remain consistent.
 
 ### 2. Length Constraints
 - **Bullets**: Maximum 220 characters. If a point is longer, split it or tighten the phrasing.

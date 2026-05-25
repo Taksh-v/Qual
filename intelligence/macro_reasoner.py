@@ -12,10 +12,15 @@ from intelligence.prompt_templates import (
     get_response_format_block,
     FINANCIAL_MECHANICS_BLOCK,
     COT_REASONING_BLOCK,
+    ADVISORY_COT_BLOCK,
+    DYNAMIC_COT_BLOCK,
     STRICT_RULES_BLOCK,
+    ADVISORY_RULES_BLOCK,
+    DYNAMIC_RULES_BLOCK,
     build_quality_rewrite_prompt as _build_quality_rewrite_prompt,
     build_citation_repair_prompt as _build_citation_repair_prompt,
 )
+from intelligence.intent_classifier import IntentClassifier
 
 
 def _to_float(value: Any) -> float | None:
@@ -312,13 +317,16 @@ def build_unified_response_prompt(
     formatted_context: str,
     geography: str = "US",
     horizon: str = "MEDIUM_TERM",
-    response_mode: str = "brief",
+    response_mode: str | None = None,
     live_data_meta: dict[str, Any] | None = None,
     reasoning_analysis: dict[str, Any] | None = None,
 ) -> str:
-    mode = (response_mode or "brief").strip().lower()
-    if mode not in {"brief", "detailed"}:
-        mode = "brief"
+    # Dynamic Intent Classification
+    intent = IntentClassifier().classify(question)
+    mode = (response_mode or intent).strip().lower()
+    
+    if mode not in {"brief", "detailed", "advisory", "alert", "dynamic"}:
+        mode = "dynamic"
     live_data_meta = live_data_meta or {}
 
     key_nums = summarize_key_numbers(indicators)
@@ -336,6 +344,7 @@ def build_unified_response_prompt(
         ("credit_hy", "HY_bps"), ("credit_ig", "IG_bps"),
         ("unemployment", "Unemp%"), ("gdp_growth", "GDP%"),
         ("pmi_mfg", "PMI_Mfg"), ("real_rate_proxy", "RealRate"),
+        ("btc_usd", "BTC"),
     ]
     for key, label in num_map:
         val = indicators.get(key)
@@ -346,7 +355,7 @@ def build_unified_response_prompt(
     format_block = get_response_format_block(mode)
 
     # Build structured market context (thematic sections from indicators)
-    if mode == "brief":
+    if mode in {"brief", "advisory", "alert"}:
         market_context_block = build_compact_market_context(indicators)
     else:
         market_context_block = build_full_market_context(indicators)
@@ -359,11 +368,27 @@ def build_unified_response_prompt(
         cross_asset=cross_asset,
     )
     reasoning_object_block = _format_reasoning_object(reasoning_analysis)
+    # Build persona and rule blocks based on mode
+    if mode == "advisory":
+        rules_block = ADVISORY_RULES_BLOCK
+        cot_block = ADVISORY_COT_BLOCK
+        mechanics_block = "" # Skip heavy institutional phases
+        persona = "Your output is read by individual investors who need clear, conversational, and data-grounded strategic advice — not dry institutional reports."
+    elif mode == "dynamic":
+        rules_block = DYNAMIC_RULES_BLOCK
+        cot_block = DYNAMIC_COT_BLOCK
+        mechanics_block = ""
+        persona = "You are a highly adaptable, elite financial AI. Adapt your response format organically to precisely match what the user requests, just like Claude. Use markdown structures like lists, paragraphs, or tables where appropriate."
+    else:
+        rules_block = STRICT_RULES_BLOCK
+        cot_block = COT_REASONING_BLOCK
+        mechanics_block = FINANCIAL_MECHANICS_BLOCK
+        persona = "Your output is read by institutional portfolio managers who need real, numbered, actionable intelligence — not commentary."
 
-    return f"""You are a senior macro strategist at a tier-1 investment bank. Your output is read by institutional portfolio managers who need real, numbered, actionable intelligence — not commentary.
-{FINANCIAL_MECHANICS_BLOCK}
-{COT_REASONING_BLOCK}
-{STRICT_RULES_BLOCK}
+    return f"""You are a senior macro strategist at a tier-1 investment bank. {persona}
+{mechanics_block}
+{cot_block}
+{rules_block}
 {format_block}
 ---
 Question: {question}
@@ -410,6 +435,7 @@ def generate_unified_fallback(
     if mode == "detailed":
         builder.executive_summary("Live market data feed is unavailable. Current regime signals a transitional environment. The primary risk drivers are policy rate trajectory and growth-inflation balance.")
         builder.direct_answer("Hold balanced positioning — no high-conviction directional call is warranted without live data confirmation.")
+        builder.strategic_synthesis("The current market regime is in a transitional state, characterized by heightened sensitivity to both inflation prints and growth signals. Without live price feeds, we cannot confirm if the recent bond yield pressure is translating into a structural multiple compression for growth equities. Investors should focus on high-quality balance sheets and defensive sector rotation until data visibility improves.")
         builder.data_snapshot("Live data unavailable — indicators below are from last known regime state.")
         builder.causal_chain(f"Uncertain macro regime → mixed growth/inflation signals → elevated cross-asset correlation → reduced diversification benefit")
         
@@ -425,6 +451,9 @@ def generate_unified_fallback(
             "FX: Dollar (DXY) typically strengthens in risk-off; EM currencies face outflow pressure.",
             "Commodities: Oil sensitive to growth outlook; gold rises on safe-haven flows."
         ])
+        # Fallback corporate/policy sections
+        builder.company_impact("S&P 500 Companies", "▼", "High interest rates increasing debt service costs across the index.")
+        builder.policy_shift("Major Central Banks", "Monetary Policy", "Hawkish Bias", "Tighter liquidity conditions persist.")
     else:
         builder.direct_answer(f"Regime is {regime_name} (signal: {signal}) — no high-conviction trade without live data confirmation.")
         builder.data_snapshot("Live data unavailable — limited to regime framework.")
@@ -439,6 +468,7 @@ def generate_unified_fallback(
             "Rates/Bonds: Flight to safety = 10Y yields fall; hawkish shock = 2Y yields spike.",
             "FX: Dollar strength in risk-off; EM currencies weaken on capital outflows."
         ])
+        builder.policy_shift("Global Environment", "Fiscal/Monetary", "Stable-Tight", "Policy path awaits clearer inflation direction.")
 
     # Predicted Events from reasoning analysis or defaults
     scenarios = reasoning_analysis.get("scenario_generator", {}) if reasoning_analysis else {}

@@ -47,11 +47,23 @@ class ToolCall:
 
 @dataclass
 class AgentOutput:
-    """Structured output produced by a single specialist agent."""
+    """
+    Structured output produced by a single specialist agent.
+
+    V5.0 Standardized Protocol:
+      - status: 'success' | 'error' | 'timeout'
+      - brief (payload): The agent's textual analysis
+      - confidence: 0.0 – 1.0
+      - tokens: Approximate token count of the payload
+      - sub_query: The original sub-question this output addresses (for integrity tracing)
+    """
 
     agent_name: str
-    brief: str  # The agent's analysis
+    brief: str  # The agent's analysis (payload)
     confidence: float  # 0.0 – 1.0
+    status: str = "success"  # success | error | timeout
+    tokens: int = 0
+    sub_query: str = ""  # The sub-question that produced this output
     evidence_citations: list[str] = field(default_factory=list)  # [S1], [S2] etc.
     gaps_identified: list[str] = field(default_factory=list)
     elapsed_ms: int = 0
@@ -59,8 +71,11 @@ class AgentOutput:
     def to_dict(self) -> dict[str, Any]:
         return {
             "agent_name": self.agent_name,
+            "status": self.status,
             "brief": self.brief,
             "confidence": self.confidence,
+            "tokens": self.tokens,
+            "sub_query": self.sub_query,
             "evidence_citations": self.evidence_citations,
             "gaps_identified": self.gaps_identified,
             "elapsed_ms": self.elapsed_ms,
@@ -96,6 +111,10 @@ class AgentState:
 
     # Agent outputs
     agent_outputs: list[AgentOutput] = field(default_factory=list)
+    valid_summaries: list[AgentOutput] = field(default_factory=list)
+
+    # Conversation context
+    conversation_context: str = ""
 
     # Synthesis / final state
     draft_answer: str = ""

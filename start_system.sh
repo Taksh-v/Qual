@@ -210,40 +210,40 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 header "Step 4 — Data Pipeline"
 
-if [[ -f "$INDEX_FILE" && "$FRESH" == "false" ]]; then
-  info "Checking embedding/index compatibility..."
-  dims=$(
-    INDEX_FILE="$INDEX_FILE" "$PYTHON" - <<'PY'
-import os
-import sys
-
-try:
-    import faiss
-    from ingestion.embeddings import get_embedding
-
-    index_path = os.environ.get("INDEX_FILE")
-    index = faiss.read_index(index_path)
-    emb = get_embedding("dimension check", normalize=True, role="query")
-    print(f"{index.d} {len(emb)}")
-except Exception as exc:
-    print(f"ERR {exc}")
-    sys.exit(0)
-PY
-  )
-
-  if [[ "$dims" == ERR* ]]; then
-    warn "Compatibility check skipped: ${dims#ERR }"
-  else
-    read -r idx_dim emb_dim <<< "$dims"
-    if [[ -n "$idx_dim" && -n "$emb_dim" && "$idx_dim" != "$emb_dim" ]]; then
-      warn "Embedding dimension ($emb_dim) does not match index dimension ($idx_dim)."
-      warn "Forcing full rebuild to avoid retrieval failures."
-      FRESH=true
-    else
-      success "Embedding/index dimensions aligned ($idx_dim)."
-    fi
-  fi
-fi
+# if [[ -f "$INDEX_FILE" && "$FRESH" == "false" ]]; then
+#   info "Checking embedding/index compatibility..."
+#   dims=$(
+#     INDEX_FILE="$INDEX_FILE" "$PYTHON" - <<'PY'
+# import os
+# import sys
+# 
+# try:
+#     import faiss
+#     from ingestion.embeddings import get_embedding
+# 
+#     index_path = os.environ.get("INDEX_FILE")
+#     index = faiss.read_index(index_path)
+#     emb = get_embedding("dimension check", normalize=True, role="query")
+#     print(f"{index.d} {len(emb)}")
+# except Exception as exc:
+#     print(f"ERR {exc}")
+#     sys.exit(0)
+# PY
+#   )
+# 
+#   if [[ "$dims" == ERR* ]]; then
+#     warn "Compatibility check skipped: ${dims#ERR }"
+#   else
+#     read -r idx_dim emb_dim <<< "$dims"
+#     if [[ -n "$idx_dim" && -n "$emb_dim" && "$idx_dim" != "$emb_dim" ]]; then
+#       warn "Embedding dimension ($emb_dim) does not match index dimension ($idx_dim)."
+#       warn "Forcing full rebuild to avoid retrieval failures."
+#       FRESH=true
+#     else
+#       success "Embedding/index dimensions aligned ($idx_dim)."
+#     fi
+#   fi
+# fi
 
 DATA_EXISTS=false
 if [[ -f "$INDEX_FILE" && -f "$METADATA_FILE" ]]; then

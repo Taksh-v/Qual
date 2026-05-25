@@ -5,6 +5,10 @@ const state = {
   latest: null,
   history: [],
   charts: {},
+  warningBadge: {
+    tier: null,
+    lastChangeTs: 0,
+  },
   generation: {
     running: false,
     section: '',
@@ -30,6 +34,7 @@ function _saveHistory() {
       signal: h.payload?.snapshot?.cross_asset?.overall_signal || '',
       quality: h.payload?.quality?.band || '',
       score: h.payload?.quality?.score || 0,
+      decision_status: h.payload?.decision_stub?.status || h.payload?._response_contract?.decision_stub?.status || '',
       model: h.payload?.model_used || '',
     }));
     localStorage.setItem(LS_KEY, JSON.stringify(slim));
@@ -193,17 +198,54 @@ function regimeClass(regimeName) {
   return 'warn';
 }
 
+const warningTierRank = { watch: 0, elevated: 1, imminent: 2 };
+
+function resolveStableWarningTier(incomingTier) {
+  const tier = String(incomingTier || '').toLowerCase();
+  if (!warningTierRank.hasOwnProperty(tier)) {
+    return state.warningBadge.tier || null;
+  }
+
+  const currentTier = state.warningBadge.tier;
+  if (!currentTier || !warningTierRank.hasOwnProperty(currentTier)) {
+    state.warningBadge.tier = tier;
+    state.warningBadge.lastChangeTs = Date.now();
+    return tier;
+  }
+
+  const currentRank = warningTierRank[currentTier];
+  const nextRank = warningTierRank[tier];
+  if (nextRank >= currentRank) {
+    state.warningBadge.tier = tier;
+    state.warningBadge.lastChangeTs = Date.now();
+    return tier;
+  }
+
+  const holdMs = 15000;
+  if (Date.now() - state.warningBadge.lastChangeTs < holdMs) {
+    return currentTier;
+  }
+
+  state.warningBadge.tier = tier;
+  state.warningBadge.lastChangeTs = Date.now();
+  return tier;
+}
+
 function updateSnapshot(snapshot) {
   const regimeBadge = document.getElementById('regimeBadge');
   const signalBadge = document.getElementById('signalBadge');
   const modelBadge = document.getElementById('modelBadge');
 
   if (regimeBadge) {
-    regimeBadge.textContent = `REGIME: ${snapshot.regime.regime || 'DETECTION...'}`;
+    const shockMode = snapshot?.external_shock?.shock_mode;
+    const shockSuffix = shockMode ? ` | SHOCK: ${String(shockMode).toUpperCase()}` : '';
+    regimeBadge.textContent = `REGIME: ${snapshot.regime.regime || 'DETECTION...'}${shockSuffix}`;
     regimeBadge.style.borderColor = 'var(--glass-border-luminous)';
   }
   if (signalBadge) {
-    signalBadge.textContent = `SIGNAL: ${snapshot.cross_asset.overall_signal || 'CALCULATING...'}`;
+    const warningTier = resolveStableWarningTier(snapshot?.regime_warning?.warning_tier);
+    const warningSuffix = warningTier ? ` | WARN: ${String(warningTier).toUpperCase()}` : '';
+    signalBadge.textContent = `SIGNAL: ${snapshot.cross_asset.overall_signal || 'CALCULATING...'}${warningSuffix}`;
     signalBadge.style.borderColor = 'var(--glass-border-luminous)';
   }
 
@@ -220,18 +262,27 @@ function updateSnapshot(snapshot) {
   if (modelBadge) modelBadge.textContent = 'INTEL: STANDBY';
 }
 
-function renderEvidenceCoverage(coverage) {
+function renderEvidenceCoverage(coverage, integrity = null) {
   const box = document.getElementById('evidenceCoverage');
   const chunks = coverage.context_chunks || 0;
   const overrideTag = coverage.has_overrides ? 'yes' : 'no';
+  const retrieval = coverage.retrieval_telemetry || null;
   const sources = (coverage.sources || []).map((s, i) =>
     `${i + 1}. ${esc(s.title)} (${esc(s.source)} | ${esc(s.date)})`
   ).join('<br>');
+  const integrityLine = integrity
+    ? `integrity_status: ${esc(String(integrity.status || 'unknown').toUpperCase())} | unsupported_claims: ${esc(integrity.unsupported_claim_count ?? 0)} | freshness: ${esc(integrity.source_freshness_score ?? 0)} | diversity: ${esc(integrity.source_diversity_score ?? 0)}`
+    : null;
+  const retrievalLine = retrieval
+    ? `retrieval: ${retrieval.hybrid_enabled ? 'hybrid' : 'semantic'} | rrf=${retrieval.rrf_applied ? 'yes' : 'no'} | fallback=${esc(String(retrieval.fallback_reason || 'none'))} | sem=${esc(retrieval.semantic_candidates ?? 0)} | bm25=${esc(retrieval.bm25_candidates ?? 0)} | final=${esc(retrieval.final_count ?? 0)}`
+    : null;
   box.innerHTML = [
     `context_chunks: ${chunks}`,
     `manual_overrides: ${overrideTag}`,
+    retrievalLine,
+    integrityLine,
     `top_sources:<br>${sources || 'No retrieved sources'}`
-  ].join('<br>');
+  ].filter(Boolean).join('<br>');
 }
 
 function resetCards() {
@@ -395,7 +446,40 @@ function renderPlainSummary(finalPayload) {
   const risk = [riskMain, watchNext].filter(Boolean).join('\n');
 
   const q = finalPayload?.quality || {};
-  const quality = `Model quality ${q.band || 'UNKNOWN'} (${q.score || 0}/100), citations=${q.citation_count || 0}, context_chunks=${q.context_chunks || 0}.`;
+  const integrity = finalPayload?.evidence_integrity || finalPayload?._response_contract?.evidence_integrity || null;
+  const regimeWarning = finalPayload?.regime_warning || finalPayload?.snapshot?.regime_warning || finalPayload?._response_contract?.regime_warning || null;
+  const decisionStub = finalPayload?.decision_stub || finalPayload?._response_contract?.decision_stub || null;
+  const counterfactual = finalPayload?.counterfactual_result || finalPayload?._response_contract?.counterfactual_result || null;
+  const personalization = finalPayload?.personalization || finalPayload?._response_contract?.personalization || null;
+  const externalShock = finalPayload?.external_shock || finalPayload?.snapshot?.external_shock || null;
+  const retrievalTelemetry = q.retrieval_telemetry || finalPayload?.snapshot?.evidence_coverage?.retrieval_telemetry || null;
+  const integrityText = integrity
+    ? `integrity=${String(integrity.status || 'unknown').toUpperCase()} support=${integrity.support_score ?? 0}% unsupported=${integrity.unsupported_claim_count ?? 0}`
+    : '';
+  const integrityMetricsText = integrity
+    ? `freshness=${integrity.source_freshness_score ?? 0} diversity=${integrity.source_diversity_score ?? 0}`
+    : '';
+  const warningText = regimeWarning
+    ? `regime_warning=${String(regimeWarning.warning_tier || 'watch').toUpperCase()} transition_prob=${Math.round((regimeWarning.transition_probability ?? 0) * 100)}%`
+    : '';
+  const decisionText = decisionStub
+    ? `decision_id=${decisionStub.decision_id || 'n/a'} status=${String(decisionStub.status || 'open').toUpperCase()}`
+    : '';
+  const counterfactualText = counterfactual
+    ? `counterfactual=ON regime_changed=${counterfactual?.delta_summary?.regime_changed ? 'YES' : 'NO'} signal_changed=${counterfactual?.delta_summary?.signal_changed ? 'YES' : 'NO'}`
+    : '';
+  const personalizationText = personalization
+    ? `personalization=${String(personalization.enforcement_mode || 'advisory').toUpperCase()} adjustments=${(personalization.recommendation_adjustments || []).length}`
+    : '';
+  const shockText = externalShock
+    ? `shock_mode=${String(externalShock.shock_mode || 'normal').toUpperCase()} shock_score=${Math.round((externalShock.external_shock_score ?? 0) * 100)}% transition=${String(externalShock.mode_transition || 'none').toUpperCase()} reweight=${String(externalShock.scenario_reweighting || 'rule_first')} manual_review=${externalShock.manual_review_required ? 'YES' : 'NO'}`
+    : '';
+  const retrievalText = retrievalTelemetry
+    ? `retrieval=${retrievalTelemetry.hybrid_enabled ? 'HYBRID' : 'SEMANTIC'} rrf=${retrievalTelemetry.rrf_applied ? 'YES' : 'NO'} fallback=${String(retrievalTelemetry.fallback_reason || 'none').toUpperCase()} sem=${retrievalTelemetry.semantic_candidates ?? 0} bm25=${retrievalTelemetry.bm25_candidates ?? 0} final=${retrievalTelemetry.final_count ?? 0}`
+    : '';
+  const qualityWarnings = Array.isArray(q.warnings) ? q.warnings.filter(Boolean) : [];
+  const warningSuffix = qualityWarnings.length ? ` Warnings: ${qualityWarnings.join(' | ')}` : '';
+  const quality = `Model quality ${q.band || 'UNKNOWN'} (${q.score || 0}/100), citations=${q.citation_count || 0}, context_chunks=${q.context_chunks || 0}${integrityText ? `, ${integrityText}` : ''}${integrityMetricsText ? `, ${integrityMetricsText}` : ''}${warningText ? `, ${warningText}` : ''}${decisionText ? `, ${decisionText}` : ''}${counterfactualText ? `, ${counterfactualText}` : ''}${personalizationText ? `, ${personalizationText}` : ''}${shockText ? `, ${shockText}` : ''}${retrievalText ? `, ${retrievalText}` : ''}.${warningSuffix}`;
 
   // Live-data clarity (when available)
   const liveMeta = finalPayload?.snapshot?.live_data_meta || {};
@@ -415,6 +499,8 @@ function renderPlainSummary(finalPayload) {
 function renderFinal(finalPayload, question) {
   updateSnapshot(finalPayload.snapshot);
   renderPlainSummary(finalPayload);
+  const integrity = finalPayload?.evidence_integrity || finalPayload?._response_contract?.evidence_integrity || null;
+  renderEvidenceCoverage(finalPayload?.snapshot?.evidence_coverage || {}, integrity);
   const modelBadge = document.getElementById('modelBadge');
   if (modelBadge) {
     const modelUsed = finalPayload?.model_used || 'N/A';
@@ -443,16 +529,40 @@ function renderFinal(finalPayload, question) {
 
 function buildComparePane(payload, question) {
   const summary = payload.response_struct?.executive_summary || pickLine(payload.response_text || '', 'Executive summary') || 'No concise summary generated.';
+  const counterfactual = payload?.counterfactual_result || payload?._response_contract?.counterfactual_result || null;
+  const deltaSummary = counterfactual?.delta_summary || null;
+  const counterfactualLine = deltaSummary
+    ? `Counterfactual: regime_changed=${deltaSummary.regime_changed ? 'YES' : 'NO'} | signal_changed=${deltaSummary.signal_changed ? 'YES' : 'NO'} | action_delta=${deltaSummary.action_delta || 'n/a'}`
+    : '';
   return [
     `Question: ${question}`,
     `Model: ${payload.model_used || 'N/A'}`,
     `Summary: ${summary}`,
     `Regime: ${payload.snapshot.regime.regime} (${payload.snapshot.regime.confidence})`,
     `Cross-Asset: ${payload.snapshot.cross_asset.overall_signal}`,
+    counterfactualLine,
     '',
     'RESPONSE',
     payload.response_text || ''
-  ].join('\n');
+  ].filter(Boolean).join('\n');
+}
+
+function _tryParseShockJson(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  if (!(raw.startsWith('{') && raw.endsWith('}'))) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const normalized = {};
+    Object.keys(parsed).forEach((k) => {
+      const v = Number(parsed[k]);
+      if (Number.isFinite(v)) normalized[k] = v;
+    });
+    return Object.keys(normalized).length ? normalized : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 function renderHistory() {
@@ -473,6 +583,7 @@ function renderHistory() {
     const qClass = qBand === 'HIGH' ? 'hi' : (qBand === 'MEDIUM' ? 'med' : (qBand === 'LOW' ? 'lo' : ''));
     const regime = h.regime || h.payload?.snapshot?.regime?.regime || '';
     const score = h.score ?? h.payload?.quality?.score ?? '';
+    const decisionStatus = (h.decision_status || h.payload?.decision_stub?.status || h.payload?._response_contract?.decision_stub?.status || '').toUpperCase();
     const model = h.model || h.payload?.model_used || '';
     const tsShort = h.ts ? new Date(h.ts).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '';
     return `<div class="history-item" data-idx="${idx}" title="Click to re-run">
@@ -480,6 +591,7 @@ function renderHistory() {
           <div class="history-meta">
             ${regime ? `<span class="h-badge ${regClass}">${esc(regime)}</span>` : ''}
             ${qBand ? `<span class="h-badge ${qClass}">${qBand}${score ? ' ' + score : ''}</span>` : ''}
+            ${decisionStatus ? `<span class="h-badge">DECISION ${esc(decisionStatus)}</span>` : ''}
             ${model ? `<span class="h-badge">${esc(model.slice(0, 22))}</span>` : ''}
             ${tsShort ? `<span class="h-badge">${tsShort}</span>` : ''}
           </div>
@@ -553,6 +665,11 @@ async function runMain() {
         if (card) card.open = true;
         touchGeneration(parsed.section, '');
       }
+      if (evt === 'clear_stream') {
+        responseRaw = '';
+        const target = document.getElementById('responseText');
+        if (target) target.innerHTML = '';
+      }
       if (evt === 'progress') {
         const stage = parsed?.stage || parsed?.error || 'working';
         setGenStatus(`Working: ${stage}`, 'running');
@@ -591,7 +708,10 @@ async function runCompare() {
   document.getElementById('compareB').textContent = 'Running second scenario...';
 
   const aPayload = basePayload(q1);
-  const bPayload = basePayload(q2);
+  const parsedShocks = _tryParseShockJson(q2);
+  const bPayload = parsedShocks
+    ? { ...basePayload(q1), counterfactual_shocks: parsedShocks }
+    : basePayload(q2);
 
   const [aRes, bRes] = await Promise.all([
     fetch('/intelligence/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(aPayload) }),
@@ -828,6 +948,21 @@ _tickClock();
 let _liveES = null;
 let _nextRefreshTimer = null;
 let _nextRefreshEnd = 0;
+
+// ── Ticker shows macro/rates/FX data (steady updates, not tick-by-tick markets) ────
+const tickerOrder = [
+  'sp500', 'nasdaq', 'dow', 'russell2000', 'vix',
+  'nifty50', 'sensex', 'ftse100', 'nikkei225', 'hangseng', 'dax',
+  'yield_10y', 'yield_2y', 'yield_3m', 'yield_30y', 'yield_curve', 'yield_curve_10y3m',
+  'fed_funds_rate', 'inflation_cpi', 'breakeven_10y',
+  'gdp_growth', 'india_gdp_growth', 'unemployment', 'pmi_mfg', 'consumer_sentiment',
+  'dxy', 'eur_usd', 'gbp_usd', 'usd_jpy', 'usd_inr', 'usd_cny',
+  'gold', 'silver', 'oil_wti', 'oil_brent', 'natural_gas', 'copper',
+  'btc_usd', 'eth_usd',
+  'sector_tech', 'sector_energy', 'sector_finance', 'sector_health', 'sector_consumer',
+  'credit_hy', 'credit_ig', 'mort_rate_30y', 'ted_spread'
+];
+
 // ── Ticker & Instant UI Bootstrap ────────────────────────────────────────
 (function bootstrapInstantUI() {
     _loadHistory();
@@ -1040,19 +1175,6 @@ function startLiveTickSimulator() {
 }
 
 // ── Live market data (SSE stream) ────────────────────────────────────────
-// ── Ticker shows macro/rates/FX data (steady updates, not tick-by-tick markets) ────
-const tickerOrder = [
-  'sp500', 'nasdaq', 'dow', 'russell2000', 'vix',
-  'nifty50', 'sensex', 'ftse100', 'nikkei225', 'hangseng', 'dax',
-  'yield_10y', 'yield_2y', 'yield_3m', 'yield_30y', 'yield_curve', 'yield_curve_10y3m',
-  'fed_funds_rate', 'inflation_cpi', 'breakeven_10y',
-  'gdp_growth', 'india_gdp_growth', 'unemployment', 'pmi_mfg', 'consumer_sentiment',
-  'dxy', 'eur_usd', 'gbp_usd', 'usd_jpy', 'usd_inr', 'usd_cny',
-  'gold', 'silver', 'oil_wti', 'oil_brent', 'natural_gas', 'copper',
-  'btc_usd', 'eth_usd',
-  'sector_tech', 'sector_energy', 'sector_finance', 'sector_health', 'sector_consumer',
-  'credit_hy', 'credit_ig', 'mort_rate_30y', 'ted_spread'
-];
 
 function _dirSign(dir) {
   return dir === 'up' ? '▲' : (dir === 'down' ? '▼' : '■');
@@ -1113,6 +1235,22 @@ function handleLiveUpdate(data) {
   const completed = data.completed_sources || [];
   const pending = data.pending_sources || [];
   const fromCache = data.from_cache === true;
+
+  const liveRegimeBadge = document.getElementById('regimeBadge');
+  if (liveRegimeBadge && data.external_shock) {
+    const shockMode = String(data.external_shock.shock_mode || 'normal').toUpperCase();
+    liveRegimeBadge.textContent = `REGIME: LIVE | SHOCK: ${shockMode}`;
+    liveRegimeBadge.style.borderColor = 'var(--glass-border-luminous)';
+  }
+
+  const liveSignalBadge = document.getElementById('signalBadge');
+  if (liveSignalBadge && data.regime_warning) {
+    const liveTier = resolveStableWarningTier(data.regime_warning.warning_tier);
+    const signalName = data.cross_asset_signal || 'LIVE';
+    const warningSuffix = liveTier ? ` | WARN: ${String(liveTier).toUpperCase()}` : '';
+    liveSignalBadge.textContent = `SIGNAL: ${signalName}${warningSuffix}`;
+    liveSignalBadge.style.borderColor = 'var(--glass-border-luminous)';
+  }
 
   // Merge new indicators into global state so partial streams don't delete defaults
   Object.keys(inds).forEach(key => {

@@ -67,6 +67,24 @@ _INTEL_CONTEXT_CACHE: bool = _env_flag("INTEL_CONTEXT_CACHE", True)
 _INTEL_CONTEXT_CACHE_TTL_SEC: float = float(os.getenv("INTEL_CONTEXT_CACHE_TTL_SEC", "180"))
 _INTEL_CONTEXT_CACHE_MAX_KEYS: int = max(32, int(os.getenv("INTEL_CONTEXT_CACHE_MAX_KEYS", "512")))
 _INTEL_RELAX_HARD_FILTER_FALLBACK: bool = _env_flag("INTEL_RELAX_HARD_FILTER_FALLBACK", True)
+_INTEL_HYBRID_RETRIEVAL: bool = _env_flag("INTEL_HYBRID_RETRIEVAL", True)
+_INTEL_HYBRID_RRF_K: int = max(1, int(os.getenv("INTEL_HYBRID_RRF_K", "60")))
+_INTEL_HYBRID_SEMANTIC_WEIGHT: float = float(os.getenv("INTEL_HYBRID_SEMANTIC_WEIGHT", "0.55"))
+_INTEL_HYBRID_BM25_WEIGHT: float = float(os.getenv("INTEL_HYBRID_BM25_WEIGHT", "0.45"))
+
+_LAST_RETRIEVAL_TELEMETRY: dict[str, Any] = {}
+_LAST_RETRIEVAL_TELEMETRY_LOCK = Lock()
+
+
+def _set_last_retrieval_telemetry(payload: dict[str, Any]) -> None:
+    with _LAST_RETRIEVAL_TELEMETRY_LOCK:
+        _LAST_RETRIEVAL_TELEMETRY.clear()
+        _LAST_RETRIEVAL_TELEMETRY.update(payload)
+
+
+def get_last_retrieval_telemetry() -> dict[str, Any]:
+    with _LAST_RETRIEVAL_TELEMETRY_LOCK:
+        return dict(_LAST_RETRIEVAL_TELEMETRY)
 
 _CONTEXT_CACHE: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
 _CONTEXT_CACHE_LOCK = Lock()
@@ -333,6 +351,18 @@ _DATA_TYPE_HINTS_SOFT: dict[str, str] = {
     r"equity research": "research_report",
     r"\bnews\b": "news",
     r"\bheadline\b": "news",
+    r"\bcorporate\b": "news",
+    r"\bexpansion\b": "news",
+    r"\bpolicy\b": "macro_commentary",
+    r"\bregulation\b": "macro_commentary",
+    r"\bcrypt\b": "news",
+    r"\btoken\b": "news",
+    r"\bforex\b": "news",
+    r"\bmsme\b": "micro_small_mid_cap",
+    r"\bsme\b": "micro_small_mid_cap",
+    r"small cap": "micro_small_mid_cap",
+    r"mid cap": "micro_small_mid_cap",
+    r"micro cap": "micro_small_mid_cap",
 }
 
 _REGION_HINTS: dict[str, list[str]] = {
@@ -342,6 +372,33 @@ _REGION_HINTS: dict[str, list[str]] = {
     "Emerging Markets": [r"\bemerging\b", r"\bbrics\b", r"\bbrazil\b", r"\bmexico\b", r"\bturkey\b"],
     "Global": [r"\bglobal\b", r"\bworldwide\b", r"\binternational\b", r"\bg20\b"],
 }
+
+_SOURCE_HINTS: dict[str, list[str]] = {
+    "Reuters": [r"\breuters\b"],
+    "Bloomberg": [r"\bbloomberg\b"],
+    "CNBC": [r"\bcnbc\b"],
+    "Financial Times": [r"\bfinancial times\b", r"\bft\b"],
+    "Economic Times": [r"\beconomic times\b"],
+    "Moneycontrol": [r"\bmoneycontrol\b"],
+}
+
+_GEO_TO_REGIONS: dict[str, set[str]] = {
+    "US": {"US"},
+    "USA": {"US"},
+    "EU": {"Europe"},
+    "EUROPE": {"Europe"},
+    "UK": {"Europe"},
+    "ASIA": {"Asia"},
+    "INDIA": {"Asia"},
+    "GLOBAL": {"Global", "US", "Europe", "Asia", "Emerging Markets"},
+}
+
+
+def _regions_from_geography(geography: str | None) -> set[str]:
+    key = str(geography or "").strip().upper()
+    if not key:
+        return set()
+    return set(_GEO_TO_REGIONS.get(key, set()))
 
 _SECTOR_HINTS: dict[str, list[str]] = {
     "Technology": [r"\btech\b", r"\bai\b", r"\bsoftware\b", r"\bsemiconductor\b"],
@@ -410,7 +467,7 @@ def _parse_time_filters(question: str) -> tuple[datetime | None, bool, int | Non
     return None, False, None
 
 
-def _extract_filters(question: str) -> dict[str, Any]:
+def _extract_filters(question: str, geography: str | None = None) -> dict[str, Any]:
     q = question.lower()
     hard: dict[str, Any] = {}
     soft: dict[str, set[str]] = {}
@@ -427,8 +484,21 @@ def _extract_filters(question: str) -> dict[str, Any]:
     for region, patterns in _REGION_HINTS.items():
         if any(re.search(pat, q) for pat in patterns):
             regions.add(region)
+    geo_regions = _regions_from_geography(geography)
+    if geo_regions:
+        hard["regions"] = geo_regions
     if regions:
-        soft["regions"] = regions
+        if "regions" in hard:
+            hard["regions"] = set(hard["regions"]).union(regions)
+        else:
+            soft["regions"] = regions
+
+    source_matches: set[str] = set()
+    for source_name, patterns in _SOURCE_HINTS.items():
+        if any(re.search(pat, q) for pat in patterns):
+            source_matches.add(source_name)
+    if source_matches:
+        hard["sources"] = source_matches
 
     sectors: set[str] = set()
     for sector, patterns in _SECTOR_HINTS.items():
@@ -467,6 +537,18 @@ def _passes_hard_filters(item: dict, filters: dict[str, Any]) -> bool:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         if dt < min_dt:
+            return False
+
+    hard_regions = hard.get("regions")
+    if hard_regions:
+        region = (md.get("region") or item.get("region") or "").strip()
+        if region not in hard_regions:
+            return False
+
+    hard_sources = hard.get("sources")
+    if hard_sources:
+        source = (md.get("source") or item.get("source") or "").strip()
+        if source not in hard_sources:
             return False
 
     return True
@@ -643,6 +725,11 @@ def _relevance_score(question: str, item: dict, filters: dict[str, Any] | None =
     score = text_hits + ent_hits + title_hits + recency + (coverage * 6.0)
     score += _phrase_score(question, item)
     score += _soft_filter_boost(item, filters)
+    
+    # MSME / Small-cap Boost
+    if any(tk in search_tokens for tk in ["msme", "sme", "smallcap", "midcap", "microcap"]):
+        score += 3.5
+    
     soft_hours = filters.get("soft_recent_hours")
     if soft_hours and _within_soft_window(item, soft_hours):
         score += 1.0
@@ -721,10 +808,11 @@ def _get_faiss_id_filter(
         soft_types = set(soft.get("data_types") or [])
         data_types = {dt for dt in soft_types if dt != "macro_commentary"}
 
-    regions = set(soft.get("regions") or [])
+    regions = set(hard.get("regions") or []) or set(soft.get("regions") or [])
     sectors = set(soft.get("sectors") or [])
+    sources = set(hard.get("sources") or [])
 
-    has_metadata_filter = bool(min_date or data_types or regions or sectors)
+    has_metadata_filter = bool(min_date or data_types or regions or sectors or sources)
     if not has_metadata_filter:
         return None, None, 0
 
@@ -739,6 +827,7 @@ def _get_faiss_id_filter(
             data_types=data_types if data_types else None,
             regions=regions if regions else None,
             sectors=sectors if sectors else None,
+            sources=sources if sources else None,
             text_terms=query_terms if query_terms else None,
             limit=_INTEL_SQLITE_PREFILTER_ROWID_LIMIT,
         )
@@ -756,6 +845,7 @@ def retrieve_relevant_context(
     top_k: int = 12,
     keep_latest: int = 8,
     rewrite: bool | None = None,
+    geography: str | None = None,
 ) -> list[dict]:
     """
     Retrieve relevant context chunks using two-stage retrieval:
@@ -770,7 +860,7 @@ def retrieve_relevant_context(
     """
     index = _load_index_cached()
     metadata = _load_metadata_cached()
-    filters = _extract_filters(question)
+    filters = _extract_filters(question, geography=geography)
 
     if index.ntotal == 0 or not metadata:
         return []
@@ -793,8 +883,26 @@ def retrieve_relevant_context(
 
     metadata_version = _metadata_version_token(metadata)
     cache_key = _context_cache_key(question, top_k, keep_latest, rewrite_enabled, metadata_version)
+    telemetry: dict[str, Any] = {
+        "cache_hit": False,
+        "rewrite_enabled": rewrite_enabled,
+        "hybrid_enabled": bool(_INTEL_HYBRID_RETRIEVAL),
+        "rrf_applied": False,
+        "bm25_used": False,
+        "semantic_candidates": 0,
+        "bm25_candidates": 0,
+        "pre_dedupe_candidates": 0,
+        "post_dedupe_candidates": 0,
+        "final_count": 0,
+        "fallback_reason": "none",
+        "filters_hard": bool(filters.get("hard")),
+        "top_chunks": [],
+    }
     cached = _context_cache_get(cache_key)
     if cached is not None:
+        telemetry["cache_hit"] = True
+        telemetry["final_count"] = len(cached)
+        _set_last_retrieval_telemetry(telemetry)
         return cached
 
     candidates: list[dict] = []
@@ -836,22 +944,38 @@ def retrieve_relevant_context(
                 if not _passes_hard_filters(item, filters):
                     continue
                 candidates.append(item)
+        telemetry["semantic_candidates"] = len(candidates)
     except Exception:
         # Fallback: lexical search on original question
         candidates = _fallback_lexical_context(question, metadata, top_k, filters=filters)
+        telemetry["fallback_reason"] = "dense_error_lexical"
+        telemetry["semantic_candidates"] = len(candidates)
 
     bm25_pairs: list[tuple[dict, float]] = []
-    bm25_idx = _load_bm25_cached()
+    bm25_idx = _load_bm25_cached() if _INTEL_HYBRID_RETRIEVAL else None
     if bm25_idx is not None:
         try:
             bm25_pairs = bm25_idx.search(question, top_k=min(max(top_k * 4, 20), len(metadata)))
             if filters.get("hard"):
                 bm25_pairs = [(item, score) for item, score in bm25_pairs if _passes_hard_filters(item, filters)]
+            telemetry["bm25_used"] = True
         except Exception:
             bm25_pairs = []
+            telemetry["bm25_used"] = True
+
+    telemetry["bm25_candidates"] = len(bm25_pairs)
 
     if bm25_pairs:
-        candidates = _rrf(candidates, bm25_pairs, semantic_weight=0.55, bm25_weight=0.45)
+        candidates = _rrf(
+            candidates,
+            bm25_pairs,
+            k=_INTEL_HYBRID_RRF_K,
+            semantic_weight=_INTEL_HYBRID_SEMANTIC_WEIGHT,
+            bm25_weight=_INTEL_HYBRID_BM25_WEIGHT,
+        )
+        telemetry["rrf_applied"] = True
+
+    telemetry["pre_dedupe_candidates"] = len(candidates)
 
     if not candidates and filters.get("hard") and _INTEL_RELAX_HARD_FILTER_FALLBACK:
         relaxed_filters = _relax_hard_filters(filters)
@@ -873,8 +997,12 @@ def retrieve_relevant_context(
                 pass
         candidates = relaxed_candidates
         active_filters = relaxed_filters
+        telemetry["fallback_reason"] = "hard_filters_relaxed"
 
     if not candidates and filters.get("hard"):
+        telemetry["fallback_reason"] = "no_candidates_after_hard_filters"
+        telemetry["final_count"] = 0
+        _set_last_retrieval_telemetry(telemetry)
         _context_cache_set(cache_key, [])
         return []
 
@@ -901,6 +1029,7 @@ def retrieve_relevant_context(
         unique.append(item)
 
     unique = _diversify_items(unique, max(keep_latest * 3, top_k * 2))
+    telemetry["post_dedupe_candidates"] = len(unique)
 
     # Stage 2b: Cross-encoder reranking on ambiguous/low-confidence cases only.
     should_rerank = _should_apply_reranker(score_trace, len(unique), keep_latest)
@@ -922,6 +1051,24 @@ def retrieve_relevant_context(
                 pass   # fall through to pre-scored order if reranker fails
 
     final_context = _diversify_items(unique, keep_latest)
+    top_chunks: list[dict[str, Any]] = []
+    for item in final_context[:5]:
+        md = item.get("metadata", {}) if isinstance(item, dict) else {}
+        try:
+            score = _relevance_score(question, item, active_filters)
+        except Exception:
+            score = 0.0
+        top_chunks.append(
+            {
+                "chunk_id": md.get("chunk_id") or item.get("chunk_id") or "",
+                "title": md.get("title") or item.get("title") or "",
+                "source": md.get("source") or item.get("source") or "",
+                "score": round(float(score), 4),
+            }
+        )
+    telemetry["top_chunks"] = top_chunks
+    telemetry["final_count"] = len(final_context)
+    _set_last_retrieval_telemetry(telemetry)
     _context_cache_set(cache_key, final_context)
     return final_context
 
@@ -937,10 +1084,11 @@ def format_context(chunks: list[dict]) -> str:
         source = md.get("source", "Unknown source")
         date = md.get("date", "Unknown date")
         extracted_at = md.get("extracted_at", "Unknown extraction time")
-        text = chunk.get("text", "")
+        dtype = chunk.get("data_type") or md.get("data_type") or "news"
+        text = chunk.get("text") or ""
 
         lines.append(
-            f"[S{i}] title={title} | source={source} | date={date} | extracted_at={extracted_at}\n{text}"
+            f"[S{i}] title={title} | source={source} | date={date} | data_type={dtype} | extracted_at={extracted_at}\n{text}"
         )
 
     return "\n\n".join(lines)

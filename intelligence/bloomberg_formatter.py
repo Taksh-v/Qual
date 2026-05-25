@@ -45,6 +45,17 @@ class BloombergFormatter:
     FLAT = "●"
     BULLET = "•"
 
+    # Box drawing characters
+    TL = "╔"
+    TR = "╗"
+    BL = "╚"
+    BR = "╝"
+    H  = "═"
+    V  = "║"
+    T  = "╦"
+    BT = "╩"
+    C  = "╬"
+
     # Regime → display badge
     _REGIME_BADGES: dict[str, str] = {
         "RISK_ON": "🟢 RISK ON",
@@ -56,56 +67,59 @@ class BloombergFormatter:
         "UNKNOWN": "⚪ REGIME UNKNOWN",
     }
 
-    # ── Direction helper ───────────────────────────────────────────────────────
-
-    def _direction_arrow(self, value: float | None, prev: float | None = None) -> str:
-        if value is None:
-            return self.FLAT
-        if prev is not None:
-            if value > prev:
-                return self.UP
-            if value < prev:
-                return self.DOWN
-            return self.FLAT
-        return self.FLAT
+    # Signal → color emoji
+    _SIGNAL_EMOJIS: dict[str, str] = {
+        "STRONG_BUY": "🟢 ▲▲",
+        "BUY": "🟢 ▲",
+        "HOLD": "🟡 ●",
+        "REDUCE": "🟠 ▼",
+        "AVOID": "🔴 ▼▼",
+        "MIXED": "⚪ ●",
+    }
 
     # ── Indicator table builder ────────────────────────────────────────────────
 
     def _build_indicator_table(self, indicators: dict[str, float]) -> str:
-        """Build a Bloomberg-style indicator table."""
+        """Build a high-density Markdown table for indicators."""
         INDICATOR_LABELS: dict[str, tuple[str, str]] = {
             "sp500": ("S&P 500", "pts"),
             "nasdaq": ("Nasdaq", "pts"),
             "vix": ("VIX", "vol"),
             "yield_10y": ("US 10Y Yield", "%"),
             "yield_2y": ("US 2Y Yield", "%"),
-            "yield_curve": ("Yield Curve (2s10s)", "bps"),
-            "dxy": ("DXY (USD Index)", ""),
-            "oil_wti": ("WTI Crude", "$/bbl"),
-            "oil_brent": ("Brent Crude", "$/bbl"),
-            "gold": ("Gold", "$/oz"),
-            "inflation_cpi": ("CPI Inflation", "% YoY"),
-            "fed_funds_rate": ("Fed Funds Rate", "%"),
-            "credit_hy": ("HY Credit Spreads", "bps"),
-            "unemployment": ("Unemployment", "%"),
-            "gdp_growth": ("GDP Growth", "% QoQ"),
+            "yield_curve": ("Yield Curve", "bps"),
+            "dxy": ("DXY Index", "pts"),
+            "oil_wti": ("WTI Crude", r"\$/b"),
+            "gold": ("Gold", r"\$/oz"),
+            "inflation_cpi": ("CPI Inflation", "%"),
+            "fed_funds_rate": ("Fed Funds", "%"),
+            "btc": ("Bitcoin", r"\$"),
         }
 
+        header = "| INDICATOR | VALUE | UNIT | TREND |\n|:---|:---:|:---:|:---:|"
         rows: list[str] = []
         for key, (label, unit) in INDICATOR_LABELS.items():
             val = indicators.get(key)
             if val is None:
                 continue
-            arrow = self.UP if val > 0 else (self.DOWN if val < 0 else self.FLAT)
-            # Special cases: VIX up = bad, yield curve negative = inverted
+            
+            # Simple trend logic
+            trend = self.FLAT
             if key == "vix":
-                arrow = self.DOWN if val < 20 else self.UP
-            val_str = f"{val:,.2f}" if abs(val) >= 100 else f"{val:.2f}"
-            rows.append(f"  {label:<28} {val_str:>10} {unit:<8} {arrow}")
+                trend = "🔴 ▲" if val > 20 else "🟢 ▼"
+            elif key == "yield_curve":
+                 trend = "🟢 ▲" if val > 0 else "🔴 ▼"
+            else:
+                 # Default logic for generic indicators
+                 trend = self.FLAT
+            
+            val_str = f"**{val:,.2f}**" if abs(val) >= 100 else f"**{val:.2f}**"
+            rows.append(f"| {label} | {val_str} | {unit} | {trend} |")
 
         if not rows:
             return "  [No live market data available]"
-        return "\n".join(rows[:12])  # Cap at 12 rows
+        
+        return header + "\n" + "\n".join(rows)
 
     # ── Public formatting methods ──────────────────────────────────────────────
 
@@ -122,12 +136,7 @@ class BloombergFormatter:
         horizon: str = "MEDIUM_TERM",
         model_used: str = "",
     ) -> str:
-        """
-        Render a full Bloomberg Morning Note.
-
-        Can be called with an AgentState (from agentic pipeline) or with
-        individual keyword arguments (from existing pipeline — backward compat).
-        """
+        """Render a Terminal-grade Morning Note."""
         now = datetime.now(timezone.utc)
         date_str = now.strftime("%Y-%m-%d %H:%M UTC")
 
@@ -149,84 +158,107 @@ class BloombergFormatter:
         regime = regime or {}
         cross_asset = cross_asset or {}
 
-        regime_label = self._REGIME_BADGES.get(
-            (regime.get("regime") or "UNKNOWN").upper(), "⚪ UNKNOWN"
-        )
-        signal = (cross_asset.get("overall_signal") or "MIXED").upper()
+        reg_name = (regime.get("regime") or "UNKNOWN").upper()
+        regime_badge = self._REGIME_BADGES.get(reg_name, "⚪ UNKNOWN")
+        
+        raw_signal = (cross_asset.get("overall_signal") or "MIXED").upper()
+        signal_emoji = self._SIGNAL_EMOJIS.get(raw_signal, "⚪ ●")
 
-        # Parse structured fields from the answer text
+        # Parse structured fields
         fields = self._parse_answer_fields(answer)
 
         sections: list[str] = []
 
-        # Header
+        # 1. Terminal Header Block
+        hdr_line = self.H * 64
         sections.append(
-            f"{self.DIVIDER}\n"
-            f"  MACRO AI INTELLIGENCE [{date_str}]\n"
-            f"  {geography} | {horizon.replace('_', ' ')} | {regime_label} | Signal: {signal}\n"
-            f"  Agent Agreement: {agent_agreement_str}\n"
-            f"{self.DIVIDER}"
+            f"{self.TL}{hdr_line}{self.TR}\n"
+            f"{self.V}  **QUAL NEWS INTELLIGENCE TERMINAL** {date_str:>23}  {self.V}\n"
+            f"{self.V}  {geography:<10} | {horizon.replace('_', ' '):<14} | {regime_badge:<18} | {self.V}\n"
+            f"{self.V}  SIGNAL: {signal_emoji:<15} | AGENT CONSENSUS: {agent_agreement_str:<12} {self.V}\n"
+            f"{self.BL}{hdr_line}{self.BR}"
         )
 
-        # Question
-        sections.append(f"\n  QUERY: {question}\n")
+        # 2. Query
+        sections.append(f"\n> **QUERY:** _{question}_\n")
 
-        # Executive Summary
+        # 3. Executive Summary (BLUF)
         exec_summary = fields.get("executive_summary") or fields.get("direct_answer") or ""
         if exec_summary:
-            sections.append(f"{self.THIN_DIV}\n  EXECUTIVE SUMMARY\n{self.THIN_DIV}")
-            sections.append(f"  {exec_summary}\n")
+            sections.append(f"### ⚡ EXECUTIVE SUMMARY\n{exec_summary}\n")
 
-        # Live Data Snapshot
-        if indicators:
-            sections.append(f"{self.THIN_DIV}\n  LIVE MARKET SNAPSHOT\n{self.THIN_DIV}")
-            sections.append(self._build_indicator_table(indicators))
-            sections.append("")
+        # 4. Structured Data Layer (V4.2)
+        # Attempt to combine sub-tables if the parent sdl field is weak/empty
+        sdl = fields.get("structured_data_layer", "").strip()
+        sub_tables = []
+        for tb in ["events_table", "market_data_table", "macro_indicators_table"]:
+            if fields.get(tb):
+                sub_tables.append(fields[tb])
+        
+        full_sdl = sdl
+        if sub_tables and len(sdl) < 20: # If parent is just a header/junk, use sub-tables
+            full_sdl = "\n\n".join(sub_tables)
 
-        # Causal Chain
-        causal = fields.get("causal_chain", "")
-        if causal:
-            sections.append(f"{self.THIN_DIV}\n  CAUSAL CHAIN\n{self.THIN_DIV}")
-            sections.append(f"  {causal}\n")
+        if full_sdl:
+            sections.append(f"### 🧱 STRUCTURED DATA LAYER\n{full_sdl}\n")
+        else:
+            # Fallback to separate sections or legacy news
+            news_brief = next((ao.brief for ao in state.agent_outputs if ao.agent_name == "NewsSpecialist"), "") if state else ""
+            if news_brief:
+                sections.append(f"### 📰 LATEST DEVELOPMENTS\n{news_brief}\n")
 
-        # What Is Happening + Market Impact
-        what_happening = fields.get("what_is_happening", fields.get("why_likely", ""))
-        market_impact = fields.get("market_impact", fields.get("market_map", ""))
-
-        if what_happening or market_impact:
-            sections.append(f"{self.THIN_DIV}\n  ANALYSIS\n{self.THIN_DIV}")
-            if what_happening:
-                sections.append(f"  What is happening:\n  {what_happening}\n")
-            if market_impact:
-                sections.append(f"  Market impact:\n  {market_impact}\n")
-
-        # Scenarios
+        # 6. Scenario Matrix
         scenarios = fields.get("scenarios", "")
         if scenarios:
-            sections.append(f"{self.THIN_DIV}\n  SCENARIO MATRIX\n{self.THIN_DIV}")
-            sections.append(f"  {scenarios}\n")
+            sections.append(f"### 🧭 SCENARIO MATRIX\n{scenarios}\n")
 
-        # Consequences + What to Watch
-        consequences = fields.get("consequences", fields.get("main_risks", ""))
-        watch = fields.get("watch_next", "")
-        if consequences or watch:
-            sections.append(f"{self.THIN_DIV}\n  RISKS & CATALYSTS TO WATCH\n{self.THIN_DIV}")
-            if consequences:
-                sections.append(f"  {self.BULLET} Risks: {consequences}")
-            if watch:
-                sections.append(f"  {self.BULLET} Watch: {watch}")
-            sections.append("")
+        # 7. Causal Transmission Analysis (V4.2)
+        causal = fields.get("causal_transmission", fields.get("causal_chain", ""))
+        if causal:
+            sections.append(f"### 🔗 CAUSAL TRANSMISSION ANALYSIS\n{causal}\n")
 
-        # Confidence + Footer
-        confidence = fields.get("confidence", "")
-        footer_parts = [f"Confidence: {confidence}" if confidence else ""]
+        # 8. Geopolitical & Systemic Risk (V4.2)
+        geo_context = fields.get("geopolitical_risk", fields.get("geopolitical_context", ""))
+        if geo_context:
+            sections.append(f"### 🌏 GEOPOLITICAL & SYSTEMIC RISK\n{geo_context}\n")
+
+        # 9. Cross-Asset Impact
+        market_impact = fields.get("market_impact", "")
+        if market_impact:
+            sections.append(f"### 📊 CROSS-ASSET IMPACT\n{market_impact}\n")
+
+        # 10. Risk Dashboard (V4.0)
+        risk_dash = fields.get("risk_dashboard", "")
+        if risk_dash:
+            sections.append(f"### 🛡️ RISK DASHBOARD\n{risk_dash}\n")
+
+        # 11. Institutional Positioning & Strategy (V4.2)
+        strategy = fields.get("institutional_strategy", fields.get("suggested_strategy", ""))
+        if strategy:
+            sections.append(f"### 💰 INSTITUTIONAL POSITIONING & STRATEGY\n{strategy}\n")
+
+        # 12. Confidence & Uncertainty (V4.2)
+        uncertainty = fields.get("uncertainty", "")
+        if uncertainty:
+            sections.append(f"### ❓ CONFIDENCE & UNCERTAINTY\n{uncertainty}\n")
+
+        # 12. Terminal Footer
+        conf_score = fields.get("confidence") or "MEDIUM"
+        source_count = len(state.retrieved_chunks) if state else 0
+        footer_parts = [
+            f"Confidence Score: **{conf_score}**",
+            f"Evidence: **{source_count} chunks**"
+        ]
         if model_used:
-            footer_parts.append(f"Model: {model_used}")
-        footer_str = " | ".join(p for p in footer_parts if p)
-        sections.append(f"{self.DIVIDER}")
-        if footer_str:
-            sections.append(f"  {footer_str}")
-        sections.append(f"{self.DIVIDER}\n")
+            footer_parts.append(f"Model: `{model_used}`")
+        footer_str = " | ".join(footer_parts)
+        
+        sections.append(f"{self.THIN_DIV}")
+        sections.append(f"  {footer_str}")
+        sections.append(f"  **DATA FRESHNESS:** LIVE (Aggregated {now.strftime('%H:%M:%S UTC')})")
+        sections.append(f"{self.THIN_DIV}")
+        
+        sections.append(f"\n> [!NOTE]\n> This is AI-generated analysis and not financial advice. Market conditions change rapidly.")
 
         return "\n".join(sections)
 
@@ -432,44 +464,64 @@ class BloombergFormatter:
         buffer: list[str] = []
 
         field_map: dict[str, str] = {
-            "executive summary:": "executive_summary",
-            "direct answer:": "direct_answer",
-            "bottom line:": "direct_answer",
-            "data snapshot:": "data_snapshot",
-            "causal chain:": "causal_chain",
-            "what is happening:": "what_is_happening",
-            "market impact:": "market_impact",
-            "scenarios": "scenarios",
-            "consequences & risks:": "consequences",
-            "consequences:": "consequences",
-            "main risks:": "main_risks",
-            "key risks:": "main_risks",
-            "what to watch:": "watch_next",
-            "what to watch next:": "watch_next",
-            "confidence:": "confidence",
-            "key drivers:": "why_likely",
-            "why it matters:": "why_likely",
+            "bluf": "executive_summary",
+            "executive summary": "executive_summary",
+            "direct answer": "direct_answer",
+            "bottom line": "direct_answer",
+            "structured data layer": "structured_data_layer",
+            "events:": "events_table",
+            "market data:": "market_data_table",
+            "macro indicators:": "macro_indicators_table",
+            "news developments": "news_developments",
+            "latest developments": "news_developments",
+            "scenario matrix": "scenarios",
+            "scenario probability matrix": "scenarios",
+            "cross-asset impact": "market_impact",
+            "causal transmission analysis": "causal_transmission",
+            "causal chain analysis": "causal_transmission",
+            "causal logic": "causal_transmission",
+            "geopolitical & systemic risk": "geopolitical_risk",
+            "geopolitical risk": "geopolitical_risk",
+            "geopolitical context": "geopolitical_risk",
+            "risk dashboard": "risk_dashboard",
+            "institutional positioning & strategy": "institutional_strategy",
+            "suggested strategy": "institutional_strategy",
+            "confidence & uncertainty": "uncertainty",
+            "confidence": "confidence",
+            "confidence score": "confidence",
         }
 
         def _flush():
             if current_field and buffer:
-                fields[current_field] = " ".join(buffer).strip()
+                fields[current_field] = "\n".join(buffer).strip()
             buffer.clear()
 
         for raw_line in text.splitlines():
             line = raw_line.strip()
-            lower = line.lower()
+            if not line:
+                continue
+                
+            # Most robust approach: Check for keywords in a "likely header" line
+            # (starts with # or * or emoji, or is all caps)
+            is_potential_header = line.startswith(('#', '*', '⚡', '⭐', '🧭', '🌏', '🔗', '🛡️', '💰', '⚠️')) or line.isupper()
+            
             matched = False
-            for prefix, fname in field_map.items():
-                if lower.startswith(prefix):
-                    _flush()
-                    current_field = fname
-                    val = line[len(prefix):].strip()
-                    if val:
-                        buffer.append(val)
-                    matched = True
-                    break
-            if not matched and current_field and line:
+            if is_potential_header:
+                clean_line = line.lower().replace('*', '').replace('#', '').strip()
+                for keyword, fname in field_map.items():
+                    if keyword in clean_line:
+                        _flush()
+                        current_field = fname
+                        matched = True
+                        # Capture trailing content on same line but skip the divider chars
+                        if ':' in line:
+                            val = line.split(':', 1)[-1].strip()
+                            val = val.strip('*# ')
+                            if val and val.lower() not in keyword:
+                                buffer.append(val)
+                        break
+            
+            if not matched and current_field:
                 buffer.append(line)
 
         _flush()

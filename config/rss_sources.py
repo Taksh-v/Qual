@@ -36,6 +36,52 @@ RSS_FEEDS: dict[str, list[tuple[str, str]]] = {
         ("Bank of England",         "https://www.bankofengland.co.uk/rss/speeches"),
         ("RBI Notifications",       "https://www.rbi.org.in/rss/NotificationsView.aspx"),
         ("OECD Latest",             "https://www.oecd.org/newsroom/rss.xml"),
+        ("Bank of Japan",           "https://www.boj.or.jp/en/rss/whatsnew.xml"),
+        ("PBoC News",               "http://www.pbc.gov.cn/english/rss/130719enrss.xml"),
+        ("Bank of Canada",          "https://www.bankofcanada.ca/feed/"),
+        ("RBA Media",               "https://www.rba.gov.au/rss/rss-media-releases.xml"),
+        ("Swiss National Bank",     "https://www.snb.ch/en/rss/mmr"),
+        ("Banco Central Brazil",    "https://www.bcb.gov.br/api/feed/sitebcb/sitefeeds/noticias"),
+    ],
+
+    # ── Europe Markets ────────────────────────────────────────────────────────
+    "europe": [
+        ("FT Markets",              "https://www.ft.com/rss/markets"),
+        ("FT Europe",               "https://www.ft.com/rss/world/europe"),
+        ("Reuters Europe Business", "https://feeds.reuters.com/reuters/UKBusiness"),
+        ("London Stock Exchange",   "https://www.londonstockexchange.com/exchange/prices-and-markets/rss/rss.xml"),
+        ("Handelsblatt (DE)",       "https://www.handelsblatt.com/contentexport/feed/schlagzeilen"),
+        ("Les Echos (FR)",          "https://www.lesechos.fr/rss/rss_economie.xml"),
+        ("Corriere Economia (IT)",  "https://xml2.corriereobjects.it/rss/economia.xml"),
+        ("EuroNews Business",       "https://www.euronews.com/rss?level=theme&name=business"),
+        ("ECB Blog",                "https://www.ecb.europa.eu/rss/blog.html"),
+    ],
+
+    # ── Asia-Pacific Markets ──────────────────────────────────────────────────
+    "asia_pacific": [
+        ("Nikkei Asia",             "https://asia.nikkei.com/rss"),
+        ("South China Morning Post","https://www.scmp.com/rss/91/feed"),
+        ("SCMP Business",           "https://www.scmp.com/rss/5/feed"),
+        ("Channel News Asia",       "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=6511"),
+        ("Straits Times Business",  "https://www.straitstimes.com/news/business/rss.xml"),
+        ("Japan Times Business",    "https://www.japantimes.co.jp/feed/business/"),
+        ("Sydney Morning Herald",   "https://www.smh.com.au/rss/business.xml"),
+        ("Korea Herald Business",   "http://www.koreaherald.com/common/rss_xml.php?ct=102"),
+        ("Taipei Times Business",   "https://www.taipeitimes.com/xml/business.rss"),
+        ("Jakarta Post Business",   "https://www.thejakartapost.com/bisnistech/feed"),
+        ("Bangkok Post Business",   "https://www.bangkokpost.com/rss/data/business.xml"),
+    ],
+
+    # ── LatAm & MENA Markets ─────────────────────────────────────────────────
+    "latam_mena": [
+        ("Reuters LatAm",          "https://feeds.reuters.com/reuters/Latinamerica"),
+        ("Bloomberg LatAm",        "https://feeds.bloomberg.com/latam/news.rss"),
+        ("Valor Economico (BR)",   "https://pox.globo.com/rss/valor/"),
+        ("El Financiero (MX)",     "https://www.elfinanciero.com.mx/rss/"),
+        ("Arab News Business",     "https://www.arabnews.com/rss/business"),
+        ("Gulf News Business",     "https://gulfnews.com/business/rss"),
+        ("Daily Sabah Economy",    "https://www.dailysabah.com/rssFeed/economy"),
+        ("Africa Business",        "https://africa.businessinsider.com/rss"),
     ],
 
     # ── Equities & Earnings ───────────────────────────────────────────────────
@@ -67,22 +113,42 @@ RSS_FEEDS: dict[str, list[tuple[str, str]]] = {
         ("CNBC Commodities",        "https://www.cnbc.com/id/15839064/device/rss/rss.html"),
         ("Bloomberg Energy",        "https://feeds.bloomberg.com/energy-and-oil/news.rss"),
         ("Natural Gas Intel",       "https://www.naturalgasintel.com/feed/"),
+        ("Mining.com",              "https://www.mining.com/feed/"),
+        ("BarChart Commodities",    "https://www.barchart.com/rss/news/commodities"),
     ],
 
     # ── India Markets ─────────────────────────────────────────────────────────
     "india": [
+        # ── Top-tier Market News ──
         ("Economic Times Markets",  "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
         ("Economic Times Economy",  "https://economictimes.indiatimes.com/news/economy/rssfeeds/1386920271.cms"),
+        ("Economic Times Stocks",   "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"),
+        ("Economic Times MF",       "https://economictimes.indiatimes.com/mf/rssfeeds/15993498.cms"),
+        ("Economic Times IPO",      "https://economictimes.indiatimes.com/markets/ipos/rssfeeds/2165229.cms"),
         ("Livemint Markets",        "https://www.livemint.com/rss/markets"),
         ("Livemint Economy",        "https://www.livemint.com/rss/economy"),
+        ("Livemint Money",          "https://www.livemint.com/rss/money"),
         ("Business Standard",       "https://www.business-standard.com/rss/markets-106.rss"),
+        ("BS Economy",              "https://www.business-standard.com/rss/economy-policy-102.rss"),
+        ("BS Companies",            "https://www.business-standard.com/rss/companies-101.rss"),
         ("Hindu Business",          "https://www.thehindu.com/business/Economy/?service=rss"),
         ("MoneyControl News",       "https://www.moneycontrol.com/rss/marketsnews.xml"),
         ("MoneyControl Economy",    "https://www.moneycontrol.com/rss/economy.xml"),
+        ("MoneyControl MF",         "https://www.moneycontrol.com/rss/mf.xml"),
+        ("MoneyControl IPO",        "https://www.moneycontrol.com/rss/ipo.xml"),
+        ("MoneyControl Results",    "https://www.moneycontrol.com/rss/results.xml"),
+        ("MoneyControl Commodities","https://www.moneycontrol.com/rss/commodities.xml"),
         ("NDTV Business",           "https://feeds.feedburner.com/NdtvProfitLatestUpdates"),
         ("Financial Express",       "https://www.financialexpress.com/feed/"),
+        # ── Regulatory ──
         ("RBI Monetary",            "https://www.rbi.org.in/rss/MonetaryPolicyView.aspx"),
-        ("SEBI",                    "https://www.sebi.gov.in/rss/sebiNewsUpdates.xml"),
+        ("RBI Notifications",       "https://www.rbi.org.in/rss/NotificationsView.aspx"),
+        ("RBI Press Releases",      "https://www.rbi.org.in/rss/PressReleaseView.aspx"),
+        ("SEBI Updates",            "https://www.sebi.gov.in/rss/sebiNewsUpdates.xml"),
+        # ── India-specific Analysis ──
+        ("Mint Lounge Business",    "https://www.livemint.com/rss/opinion"),
+        ("FirstPost Business",      "https://www.firstpost.com/rss/business.xml"),
+        ("Outlook Business",        "https://www.outlookbusiness.com/rss"),
     ],
 
     # ── Geopolitics & Trade ───────────────────────────────────────────────────
@@ -126,6 +192,33 @@ RSS_FEEDS: dict[str, list[tuple[str, str]]] = {
         ("CoinTelegraph",           "https://cointelegraph.com/rss"),
         ("Decrypt",                 "https://decrypt.co/feed"),
         ("The Block",               "https://www.theblock.co/rss.xml"),
+        ("Blockworks",              "https://blockworks.co/feed"),
+        ("Bitcoin Magazine",        "https://bitcoinmagazine.com/.rss/full/"),
+    ],
+
+    # ── Policy & Regulation ───────────────────────────────────────────────────
+    "policy_regulation": [
+        ("Politico Economy",        "https://www.politico.com/rss/economy.xml"),
+        ("The Hill Business",       "https://thehill.com/business-lobbying/feed/"),
+        ("FCA News",                "https://www.fca.org.uk/news/rss.xml"),
+        ("SEC Press Releases",      "https://www.sec.gov/news/pressreleases.rss"),
+    ],
+
+    # ── SEC & Regulatory Filings (Quantum Pulse) ────────────────────────────────
+    "sec_filings": [
+        ("SEC Press Releases",      "https://www.sec.gov/news/pressreleases.rss"),
+        ("SEC Speeches",            "https://www.sec.gov/news/speeches.rss"),
+        ("SEC Litigation",          "https://www.sec.gov/litigation/litreleases.rss"),
+        ("SEC Trading Suspensions", "https://www.sec.gov/litigation/suspensions.rss"),
+        ("SEC Staff Guidance",      "https://www.sec.gov/news/studies.rss"),
+    ],
+
+    # ── Breaking News Wires (Quantum Pulse) ───────────────────────────────────
+    "breaking_news": [
+        ("GlobeNewswire",           "https://www.globenewswire.com/RssFeed/subjectcode/01-Debt%20Financing/feedTitle/GlobeNewswire%20-%20Debt%20Financing"),
+        ("PR Newswire Finance",     "https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss"),
+        ("BusinessWire",            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRWQ=="),
+        ("AP Business",             "https://rsshub.app/apnews/topics/business"),
     ],
 }
 
@@ -141,5 +234,13 @@ PRIORITY_FEEDS: list[tuple[str, str, str]] = [
     (cat, lbl, url)
     for cat, feeds in RSS_FEEDS.items()
     if cat in ("us_macro", "equities", "india", "commodities", "central_banks")
+    for lbl, url in feeds
+]
+
+# ── Quantum Pulse: Ultra-high-frequency feeds (polled every 60s) ─────────────
+PULSE_FEEDS: list[tuple[str, str, str]] = [
+    (cat, lbl, url)
+    for cat, feeds in RSS_FEEDS.items()
+    if cat in ("sec_filings", "breaking_news")
     for lbl, url in feeds
 ]

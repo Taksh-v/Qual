@@ -28,6 +28,14 @@ from intelligence.query_rewriter import rewrite_query, _deterministic_expand
 from intelligence.data_quality import evaluate_retrieval_quality, evaluate_vector_store_health
 from intelligence.model_router import get_model_candidates
 from intelligence.analyst_agents import run_fundamental_analyst, run_sentiment_analyst, run_portfolio_manager
+from intelligence.intent_classifier import IntentClassifier
+from intelligence.prompt_templates import (
+    ADVISORY_RULES_BLOCK,
+    ADVISORY_COT_BLOCK,
+    DYNAMIC_RULES_BLOCK,
+    DYNAMIC_COT_BLOCK,
+    get_response_format_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +332,12 @@ _DATA_TYPE_HINTS_SOFT: dict[str, str] = {
     r"equity research": "research_report",
     r"\bnews\b": "news",
     r"\bheadline\b": "news",
+    r"\bcrypto\b": "crypto",
+    r"\bbitcoin\b": "crypto",
+    r"\bethereum\b": "crypto",
+    r"\bcompany\b": "company",
+    r"\bcorporate\b": "company",
+    r"\bticker\b": "company",
 }
 
 
@@ -666,11 +680,42 @@ def _title_score(tokens: set[str], chunk: dict[str, Any]) -> float:
 
 def _entity_score(tokens: set[str], chunk: dict[str, Any]) -> float:
     md = _get_metadata(chunk)
-    entities = md.get("entities") or []
+    entities = md.get("entity_list") or md.get("entities") or []
     if not entities or not tokens:
         return 0.0
+    
+    if isinstance(entities, dict):
+        # Handle structured entity dict from ner_extractor
+        flat = []
+        for val in entities.values():
+            if isinstance(val, list):
+                flat.extend(val)
+        entities = list(set(flat))
+
     entity_tokens = {_normalize_term(tok) for tok in _tokenize(" ".join(entities))}
-    return float(sum(1.6 for t in tokens if t in entity_tokens))
+    score = 0.0
+    for t in tokens:
+        if t in entity_tokens:
+            score += 2.5  # Increased from 1.6 for stronger entity matching
+    return float(score)
+
+
+def _entity_discovery_score(question: str, chunk: dict[str, Any]) -> float:
+    """
+    Boost chunks that contain potential entity matches in their text,
+    even if not explicitly tagged in metadata (discovery mode).
+    """
+    text = (chunk.get("text") or "").lower()
+    # Extract potential tickers (3-5 uppercase) or specific capitalized names from question
+    q_entities = re.findall(r"\b[A-Z]{3,5}\b|\b(?:Nvidia|Tesla|Apple|Microsoft|Bitcoin|Ethereum|Solana)\b", question)
+    if not q_entities:
+        return 0.0
+    
+    score = 0.0
+    for ent in q_entities:
+        if ent.lower() in text:
+            score += 2.0
+    return score
 
 
 def _soft_filter_boost(chunk: dict[str, Any], filters: dict[str, Any]) -> float:
@@ -731,6 +776,7 @@ def _rank_score(question: str, chunk: dict[str, Any], filters: dict[str, Any]) -
     score += _entity_score(q_tokens, chunk)
     score += _phrase_score(question, chunk)
     score += _soft_filter_boost(chunk, filters)
+    score += _entity_discovery_score(question, chunk)
 
     soft_hours = filters.get("soft_recent_hours")
     if soft_hours and _within_soft_window(chunk, soft_hours):
@@ -1465,6 +1511,11 @@ async def run_query(question: str) -> tuple[str, list[dict[str, Any]]]:
 
     store_health = evaluate_vector_store_health(index.ntotal, metadata)
 
+    # --- PERSONA DETECTION ---
+    classifier = IntentClassifier()
+    intent = classifier.classify(question)
+    # -------------------------
+
     optimized_question = rewrite_query(question) if RAG_ENABLE_QUERY_REWRITE else _deterministic_expand(question)
     adaptive_top_k, adaptive_context_chars = _adaptive_retrieval_budget(question)
     retrieval_error = None
@@ -1506,8 +1557,51 @@ async def run_query(question: str) -> tuple[str, list[dict[str, Any]]]:
         snap = get_live_market_snapshot()
         mechanics = get_dominant_mechanics_block(snap)
 
-        # ── PASS 1: The Foundation ────────────────────────────────────────────────
-        pass_1_prompt = f"""You are a senior macro strategist.
+        # ── PERSONA SELECTION ─────────────────────────────────────────────────────
+        if intent == "advisory":
+            # Conversational single-pass for personal advice
+            advisory_prompt = f"""You are my personal Financial Advisor. 
+Answer my question in a conversational, helpful, yet professional tone.
+
+{ADVISORY_RULES_BLOCK}
+
+{mechanics}
+
+News Context: {context_text}
+Live Data: {snap.format_for_prompt()}
+
+{ADVISORY_COT_BLOCK}
+
+Question: {question}
+
+Response (Conversational Markdown):
+"""
+            answer = ask_llm(advisory_prompt, options=_main_options)
+            generation_mode = "advisory_single_pass"
+        elif intent == "dynamic":
+            # Adaptive single-pass conforming to user structure
+            dynamic_prompt = f"""You are a highly adaptable, elite financial AI analyzing the market. 
+Adapt your format organically exactly as the user requests or implicitly needs (like Claude does). 
+Use Markdown structure, bullet points, or tables only where appropriate.
+
+{DYNAMIC_RULES_BLOCK}
+
+{mechanics}
+
+News Context: {context_text}
+Live Data: {snap.format_for_prompt()}
+
+{DYNAMIC_COT_BLOCK}
+
+Question: {question}
+
+Response:
+"""
+            answer = ask_llm(dynamic_prompt, options=_main_options)
+            generation_mode = "dynamic_single_pass"
+        else:
+            # ── PASS 1: The Foundation ────────────────────────────────────────────────
+            pass_1_prompt = f"""You are a senior macro strategist.
 {mechanics}
 Analyze the news context and live data to establish the Foundation facts.
 
@@ -1525,10 +1619,10 @@ Primary: <Trigger> -> <Mechanism> -> <Outcome>
 Secondary: <Trigger> -> <Mechanism> -> <Outcome>
 Data snapshot: {snap.format_for_prompt()}
 """
-        pass_1_out = ask_llm(pass_1_prompt, options=_main_options)
+            pass_1_out = ask_llm(pass_1_prompt, options=_main_options)
 
-        # ── PASS 2: The Impact ────────────────────────────────────────────────────
-        pass_2_prompt = f"""You are a senior macro strategist.
+            # ── PASS 2: The Impact ────────────────────────────────────────────────────
+            pass_2_prompt = f"""You are a senior macro strategist.
 {mechanics}
 Based on the Foundation below, strictly determine the Cross-Asset Impacts.
 
@@ -1543,10 +1637,10 @@ Cross-asset impact:
 - <impact string format: Asset [Direction]: Reasoning>
 - <impact string format: Asset [Direction]: Reasoning>
 """
-        pass_2_out = ask_llm(pass_2_prompt, options=_main_options)
+            pass_2_out = ask_llm(pass_2_prompt, options=_main_options)
 
-        # ── PASS 3: The Action ────────────────────────────────────────────────────
-        pass_3_prompt = f"""You are a senior macro strategist.
+            # ── PASS 3: The Action ────────────────────────────────────────────────────
+            pass_3_prompt = f"""You are a senior macro strategist.
 {mechanics}
 
 FOUNDATION:
@@ -1574,10 +1668,11 @@ What to watch:
 - <Item 2>
 Confidence: <HIGH/MEDIUM/LOW> - <reason>
 """
-        pass_3_out = ask_llm(pass_3_prompt, options=_main_options)
+            pass_3_out = ask_llm(pass_3_prompt, options=_main_options)
 
-        # Stitch all outputs together for the normalizer
-        answer = f"{pass_1_out}\n\n{pass_2_out}\n\n{pass_3_out}"
+            # Stitch all outputs together for the normalizer
+            answer = f"{pass_1_out}\n\n{pass_2_out}\n\n{pass_3_out}"
+            generation_mode = "llm_3_pass_institutional"
         
         answer = _sanitize_unsupported_numbers(answer, chunks)
         answer_quality = _evaluate_answer_quality(answer, chunks)

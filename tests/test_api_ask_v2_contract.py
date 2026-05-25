@@ -50,6 +50,11 @@ def test_ask_includes_response_contract_metadata(client: TestClient, monkeypatch
 	assert "_response_contract" in payload
 	assert payload["_response_contract"]["schema_version"] == "v2"
 	assert isinstance(payload["_response_contract"]["validation_ok"], bool)
+	assert "evidence_integrity" in payload["_response_contract"]
+	assert "regime_warning" in payload["_response_contract"]
+	assert "decision_stub" in payload["_response_contract"]
+	assert "counterfactual_result" in payload["_response_contract"]
+	assert "personalization" in payload["_response_contract"]
 
 
 def test_ask_fallback_still_has_response_contract(client: TestClient, monkeypatch) -> None:
@@ -65,4 +70,32 @@ def test_ask_fallback_still_has_response_contract(client: TestClient, monkeypatc
 	payload = response.json()
 	assert "_response_contract" in payload
 	assert payload["_response_contract"]["schema_version"] == "v2"
+
+
+def test_ask_preserves_optional_contract_blocks(client: TestClient, monkeypatch) -> None:
+	api_app = importlib.import_module("api.app")
+
+	async def _fake_ask_rag(question: str) -> dict:
+		return {
+			"question": question,
+			"answer": "Direct answer: A\nData snapshot: B\nCausal chain: C\n",
+			"sources": [],
+			"evidence_integrity": {"status": "warning", "unsupported_claim_count": 1},
+			"regime_warning": {"warning_tier": "watch", "transition_probability": 0.4},
+			"decision_stub": {"decision_id": "d-1", "horizon": "7-30d"},
+			"counterfactual_result": {"requested": False},
+			"personalization": {"enforcement_mode": "advisory"},
+		}
+
+	monkeypatch.setattr(api_app, "ask_rag", _fake_ask_rag)
+
+	response = client.post("/ask", json={"question": "test question"})
+	assert response.status_code == 200
+	payload = response.json()
+	contract = payload["_response_contract"]
+	assert contract["evidence_integrity"]["status"] == "warning"
+	assert contract["regime_warning"]["warning_tier"] == "watch"
+	assert contract["decision_stub"]["decision_id"] == "d-1"
+	assert contract["counterfactual_result"]["requested"] is False
+	assert contract["personalization"]["enforcement_mode"] == "advisory"
 

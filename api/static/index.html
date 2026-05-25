@@ -6,6 +6,14 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Inter+Tight:wght@500;600;700;800;900&family=Space+Grotesk:wght@400;500;700&family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link rel="stylesheet" href="/static/style.css" />
+<!-- Suppress Tailwind CDN production warning -->
+<script>
+  const _originalWarn = console.warn;
+  console.warn = function(...args) {
+    if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com should not be used in production')) return;
+    _originalWarn.apply(console, args);
+  };
+</script>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries,typography"></script>
 <script id="tailwind-config">
       tailwind.config = {
@@ -385,7 +393,7 @@
 </div>
 </div>
 </main>
-<script src="/static/script.js?v=16"></script>
+<script src="/static/script.js?v=18"></script>
 <!-- Hidden Legacy IDs to prevent script.js crashes -->
 <div style="display:none;" id="legacy-stubs">
     <div id="detected"></div>

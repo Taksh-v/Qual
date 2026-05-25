@@ -153,6 +153,22 @@ class ResponseRenderer:
                 lines.append(f"- {gap}")
             lines.append("")
 
+        if resp.corporate_intelligence:
+            lines.append("## 🏢 Corporate Intelligence")
+            lines.append("| Entity | Impact | Analysis |")
+            lines.append("|--------|--------|----------|")
+            for ci in resp.corporate_intelligence:
+                lines.append(ci.as_row())
+            lines.append("")
+
+        if resp.policy_intelligence:
+            lines.append("## 🏛️ Policy Intelligence")
+            lines.append("| Authority | Event | Status | Implication |")
+            lines.append("|-----------|-------|--------|-------------|")
+            for ps in resp.policy_intelligence:
+                lines.append(ps.as_row())
+            lines.append("")
+
         lines.append(f"**Confidence:** {resp.confidence}")
 
         return "\n".join(lines)
@@ -241,6 +257,18 @@ class ResponseRenderer:
         
         if resp.data_gaps:
             result["data_gaps"] = resp.data_gaps
+
+        if resp.corporate_intelligence:
+            result["corporate_intelligence"] = [
+                {"entity": ci.entity, "impact_rating": ci.impact_rating, "narrative": ci.narrative, "ticker": ci.ticker}
+                for ci in resp.corporate_intelligence
+            ]
+
+        if resp.policy_intelligence:
+            result["policy_intelligence"] = [
+                {"authority": ps.authority, "policy_event": ps.policy_event, "status": ps.status, "macro_implication": ps.macro_implication}
+                for ps in resp.policy_intelligence
+            ]
             
         result["confidence"] = resp.confidence
 

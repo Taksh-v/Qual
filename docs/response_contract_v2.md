@@ -10,6 +10,7 @@ This document defines the normalized writing and response format contract introd
 ## Backward compatibility
 - Existing keys such as `question`, `answer`, and `sources` are preserved.
 - New contract metadata is appended under `_response_contract`.
+- Optional advanced blocks may also appear at top-level without affecting legacy parsing.
 - No endpoint path or request body changes are required.
 
 ## Contract metadata
@@ -21,10 +22,19 @@ Every normalized payload can include:
 		"schema_version": "v2",
 		"mode": "brief",
 		"validation_ok": true,
-		"validation_warnings": []
+		"validation_warnings": [],
+		"evidence_integrity": null,
+		"regime_warning": null,
+		"decision_stub": null,
+		"counterfactual_result": null,
+		"personalization": null
 	}
 }
 ```
+
+These five blocks are optional and are only populated when enabled by feature flags or
+explicitly provided by the caller. When present, they are mirrored in `_response_contract`
+for a stable inspection path. Legacy clients can safely ignore them.
 
 ## Canonical response sections
 The writing contract targets these sections:
@@ -43,6 +53,13 @@ Detailed mode additionally supports:
 - `Key risks`
 - `Time horizons`
 
+Optional advanced contract blocks (Phase 1 foundation):
+- `evidence_integrity`
+- `regime_warning`
+- `decision_stub`
+- `counterfactual_result`
+- `personalization`
+
 ## Implementation modules
 - `intelligence/response_schema.py`: dataclasses for structured response.
 - `intelligence/response_builder.py`: mode-specific builders.
@@ -57,4 +74,5 @@ Detailed mode additionally supports:
 - Scenario probabilities should sum to approximately 100%.
 - Predicted events should include trigger and invalidation.
 - Warnings are attached in metadata, without breaking existing payloads.
+- Optional advanced blocks are schema-validated only when present.
 

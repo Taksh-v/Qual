@@ -46,52 +46,57 @@ class SECExtractor:
     def __init__(self, user_agent: str = "Qual-Intelligence-System qual@example.com"):
         # SEC requires a descriptive user agent
         self.headers = {"User-Agent": user_agent}
-        self.rss_url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-k&company=&dateb=&owner=include&start=0&count=40&output=atom"
+        self.base_rss_url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type={type}&company=&dateb=&owner=include&start=0&count=40&output=atom"
+        self.default_types = ["8-K", "10-Q", "10-K"]
         
-    def fetch_latest_8k(self) -> List[Dict[str, Any]]:
+    def fetch_latest_filings(self, form_types: List[str] = None) -> List[Dict[str, Any]]:
         """
-        Fetches the latest 8-K filings from EDGAR.
+        Fetches the latest filings for specified types (defaults to 8-K, 10-Q, 10-K).
         """
-        response = _fetch_with_retry(self.rss_url, headers=self.headers)
-        feed = feedparser.parse(response.content)
-        extracted = []
-        
-        for entry in feed.entries:
-            # We want the link to the actual filing
-            try:
-                title_parts = entry.title.split(' - ', 1)
-                form_type = title_parts[0].strip()
-                company_raw = title_parts[1].strip() if len(title_parts) > 1 else "Unknown"
-                company_name = company_raw.split(' (')[0].strip()
-                
-                filing_info = {
-                    "source": "SEC EDGAR",
-                    "doc_type": form_type,
-                    "company": company_name,
-                    "title": entry.title,
-                    "url": entry.link,
-                    "published_at": entry.updated,
-                    "summary": entry.summary if hasattr(entry, 'summary') else "",
-                    "extracted_at": datetime.now(timezone.utc).isoformat()
-                }
-                
-                # Fetch the raw text of the filing
-                # EDGAR links point to an index page; we need to find the primary document
-                # For this MVP, we scrape the index page, find the first matching .htm file
-                document_url = self._get_primary_document_url(entry.link)
-                if document_url:
-                    text_content = self._extract_filing_text(document_url)
-                    filing_info["raw_text"] = text_content
-                    extracted.append(filing_info)
-                
-                # Be polite to the SEC API (0.3s between requests)
-                time.sleep(0.3)
+        types = form_types or self.default_types
+        all_extracted = []
 
+        for ftype in types:
+            url = self.base_rss_url.format(type=ftype)
+            logger.info(f"[SEC] Fetching latest {ftype} filings from EDGAR...")
+            try:
+                response = _fetch_with_retry(url, headers=self.headers)
+                feed = feedparser.parse(response.content)
                 
+                for entry in feed.entries:
+                    # We want the link to the actual filing
+                    try:
+                        title_parts = entry.title.split(' - ', 1)
+                        form_type = title_parts[0].strip()
+                        company_raw = title_parts[1].strip() if len(title_parts) > 1 else "Unknown"
+                        company_name = company_raw.split(' (')[0].strip()
+                        
+                        filing_info = {
+                            "source": "SEC EDGAR",
+                            "doc_type": form_type,
+                            "company": company_name,
+                            "title": entry.title,
+                            "url": entry.link,
+                            "published_at": getattr(entry, 'updated', ''),
+                            "summary": entry.summary if hasattr(entry, 'summary') else "",
+                            "extracted_at": datetime.now(timezone.utc).isoformat()
+                        }
+                        
+                        # Fetch the raw text of the filing
+                        document_url = self._get_primary_document_url(entry.link)
+                        if document_url:
+                            text_content = self._extract_filing_text(document_url)
+                            filing_info["raw_text"] = text_content
+                            all_extracted.append(filing_info)
+                        
+                        # Be polite to the SEC API (0.3s between requests)
+                        time.sleep(0.3)
+                    except Exception as e:
+                        logger.error(f"[SEC Extractor] Error parsing entry {entry.title}: {e}")
             except Exception as e:
-                print(f"[SEC Extractor] Error parsing entry {entry.title}: {e}")
+                logger.error(f"[SEC Extractor] Error fetching {ftype}: {e}")
                 
-        return extracted
+        return all_extracted
         
     def _get_primary_document_url(self, index_url: str) -> str:
         """

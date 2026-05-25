@@ -54,6 +54,7 @@ from contextlib import contextmanager
 from typing import Any, Generator
 
 from intelligence.sentiment_analyzer import score_sentiment
+from ingestion.storage_manager import StorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class MetadataStore:
         self.db_path = db_path
         self._fts_available = False
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self.storage_v3 = StorageManager(db_path=self.db_path)
         try:
             self._init_db()
         except sqlite3.DatabaseError as exc:
@@ -315,6 +317,18 @@ class MetadataStore:
             conn.executemany(sql, rows)
 
         logger.info("[MetadataStore] Upserted %d chunks (rowid %d–%d)", len(rows), start_rowid, start_rowid + len(rows) - 1)
+        
+        # V3 Quantum Analysis Framework: Columnar Export
+        try:
+            if rows:
+                # Group by data_type for correct partitioning if mixed
+                data_types = {r.get("data_type", "unknown") for r in rows}
+                for dtype in data_types:
+                    dtype_rows = [r for r in rows if r.get("data_type") == dtype]
+                    self.storage_v3.export_to_parquet(dtype_rows, data_type=dtype)
+        except Exception as e:
+            logger.error(f"[MetadataStore] V3 Parquet export failed: {e}")
+
         return len(rows)
 
     def delete_by_chunk_ids(self, chunk_ids: list[str]) -> int:

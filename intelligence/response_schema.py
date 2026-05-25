@@ -127,6 +127,38 @@ class KeyLevel:
 
 
 @dataclass
+class CompanyImpact:
+    """Specific entity analysis."""
+    entity: str
+    impact_rating: str  # ▲ / ▼ / ●
+    narrative: str
+    ticker: str | None = None
+
+    def as_bullet(self) -> str:
+        t = f" [{self.ticker}]" if self.ticker else ""
+        return f"{self.impact_rating} {self.entity}{t}: {self.narrative}"
+
+    def as_row(self) -> str:
+        t = f" ({self.ticker})" if self.ticker else ""
+        return f"| {self.entity}{t} | {self.impact_rating} | {self.narrative} |"
+
+
+@dataclass
+class PolicyShift:
+    """Central bank or government policy analysis."""
+    authority: str
+    policy_event: str
+    status: str
+    macro_implication: str
+
+    def as_bullet(self) -> str:
+        return f"{self.authority} ({self.status}): {self.policy_event} — {self.macro_implication}"
+
+    def as_row(self) -> str:
+        return f"| {self.authority} | {self.policy_event} | {self.status} | {self.macro_implication} |"
+
+
+@dataclass
 class ResponseMetadata:
     mode: str = "brief"
     model_used: str = "N/A"
@@ -134,6 +166,52 @@ class ResponseMetadata:
     citation_count: int | None = None
     warnings: list[str] = field(default_factory=list)
     generated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass
+class EvidenceIntegrity:
+    support_score: float | None = None
+    unsupported_claim_count: int = 0
+    source_freshness_score: float | None = None
+    source_diversity_score: float | None = None
+    status: str | None = None  # pass | warning | review_required
+    warning_level: str | None = None
+
+
+@dataclass
+class RegimeWarning:
+    warning_tier: str | None = None  # watch | elevated | imminent
+    transition_probability: float | None = None
+    likely_next_regime: str | None = None
+    triggers: list[str] = field(default_factory=list)
+    invalidations: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DecisionStub:
+    decision_id: str | None = None
+    recommendation: str | None = None
+    horizon: str | None = None
+    trigger: str | None = None
+    invalidation: str | None = None
+    confidence: str | None = None
+
+
+@dataclass
+class CounterfactualResult:
+    requested: bool = False
+    baseline: dict[str, Any] = field(default_factory=dict)
+    shocked: dict[str, Any] = field(default_factory=dict)
+    delta_summary: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Personalization:
+    profile_version: str | None = None
+    enforcement_mode: str | None = None  # advisory | strict
+    applied_constraints: list[str] = field(default_factory=list)
+    recommendation_adjustments: list[str] = field(default_factory=list)
+    rationale: str | None = None
 
 
 @dataclass
@@ -151,6 +229,7 @@ class StructuredResponse:
     executive_summary: str | None = None
     key_risks: list[str] = field(default_factory=list)
     time_horizons: list[str] = field(default_factory=list)
+    strategic_synthesis: str | None = None
     metadata: ResponseMetadata = field(default_factory=ResponseMetadata)
 
     # ── New Macro Intelligence Briefing fields ────────────────────────────
@@ -162,6 +241,15 @@ class StructuredResponse:
     key_levels: list[KeyLevel] = field(default_factory=list)
     historical_analog: str | None = None                             # Comparable episode
     data_gaps: list[str] = field(default_factory=list)               # Explicitly missing data
+    corporate_intelligence: list[CompanyImpact] = field(default_factory=list)
+    policy_intelligence: list[PolicyShift] = field(default_factory=list)
+
+    # ── Phase 1 optional contract blocks ────────────────────────────────
+    evidence_integrity: EvidenceIntegrity | None = None
+    regime_warning: RegimeWarning | None = None
+    decision_stub: DecisionStub | None = None
+    counterfactual_result: CounterfactualResult | None = None
+    personalization: Personalization | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -186,9 +274,12 @@ class StructuredResponse:
             [
                 f"Direct answer: {self.direct_answer}",
                 f"Data snapshot: {self.data_snapshot}",
-                f"Causal chain: {self.causal_chain}",
             ]
         )
+        if self.strategic_synthesis:
+            lines.append(f"Strategic synthesis (The 'Connecting the Dots' section):")
+            lines.append(self.strategic_synthesis)
+        lines.append(f"Causal chain: {self.causal_chain}")
 
         # ── Causal architecture (new) ─────────────────────────────────
         if self.causal_architecture:
@@ -240,6 +331,14 @@ class StructuredResponse:
         if self.data_gaps:
             lines.append("Data gaps:")
             lines.extend(f"- {g}" for g in self.data_gaps)
+
+        if self.corporate_intelligence:
+            lines.append("Corporate intelligence:")
+            lines.extend(f"- {ci.as_bullet()}" for ci in self.corporate_intelligence)
+
+        if self.policy_intelligence:
+            lines.append("Policy intelligence:")
+            lines.extend(f"- {ps.as_bullet()}" for ps in self.policy_intelligence)
 
         lines.append(f"Confidence: {self.confidence}")
         return "\n".join(lines)

@@ -1,11 +1,12 @@
 import json
 import os
+import argparse
 from pathlib import Path
 from statistics import median
 
 import faiss
 
-from intelligence.data_quality import evaluate_vector_store_health
+from intelligence.data_quality import evaluate_vector_store_health, evaluate_ingestion_quality
 
 ROOT = Path(__file__).resolve().parent
 INDEX_PATH = ROOT / "data" / "vector_db" / "news.index"
@@ -26,6 +27,11 @@ def _chunk_word_stats(metadata: list[dict]) -> dict:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Run vector + ingestion quality audit.")
+    parser.add_argument("--strict", action="store_true", help="Return non-zero when any quality block is BAD.")
+    parser.add_argument("--stale-days", type=int, default=120, help="Staleness threshold in days.")
+    args = parser.parse_args()
+
     if not INDEX_PATH.exists() or not METADATA_PATH.exists():
         print("❌ Missing index or metadata in data/vector_db. Run embedding pipeline first.")
         return 1
@@ -35,9 +41,11 @@ def main() -> int:
         metadata = json.load(f)
 
     health = evaluate_vector_store_health(index.ntotal, metadata)
+    ingestion = evaluate_ingestion_quality(metadata, stale_days=max(1, int(args.stale_days)))
     stats = _chunk_word_stats(metadata)
     report = {
         "vector_store_health": health,
+        "ingestion_quality": ingestion,
         "chunk_word_stats": stats,
     }
 
@@ -47,6 +55,10 @@ def main() -> int:
     print("✅ Data quality audit complete")
     print(json.dumps(report, indent=2))
     print(f"\nReport saved to: {REPORT_PATH}")
+
+    if args.strict and (health.get("status") == "BAD" or ingestion.get("status") == "BAD"):
+        print("❌ Strict mode: quality audit failed.")
+        return 2
     return 0
 
 

@@ -37,6 +37,7 @@ from config.rss_sources import ALL_FEEDS, PRIORITY_FEEDS
 from ingestion.rss_fetcher import fetch_all_feeds
 from ingestion.chunker import chunk_text
 from ingestion.embeddings import get_embeddings
+from ingestion.metadata_store import MetadataStore
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw", "rss")
@@ -165,22 +166,19 @@ def upsert_chunks_to_index(
         print(f"[DRY RUN] Would embed {len(chunks)} chunks.")
         return stats
 
-    # Resolve index & metadata paths
+    # Resolve index path
     index_path = _first_existing(INDEX_CANDIDATES) or INDEX_CANDIDATES[0]
-    metadata_path = _first_existing(METADATA_CANDIDATES) or METADATA_CANDIDATES[0]
     stats["index_path"] = index_path
-    stats["metadata_path"] = metadata_path
+    
+    # Initialize MetadataStore (uses default path)
+    store = MetadataStore()
+    stats["metadata_path"] = store.db_path
 
-    # Load existing
-    metadata = _load_metadata(metadata_path)
+    # Load existing FAISS index
     index = _load_faiss_index(index_path) if os.path.exists(index_path) else None
-    if index is not None:
-        try:
-            import faiss
-            if getattr(index, "metric_type", None) == faiss.METRIC_L2:
-                print("[WARN] Existing index uses L2 metric. Consider rebuilding for cosine/IP.")
-        except Exception:
-            pass
+    
+    # We will collect new chunks to upsert into MetadataStore
+    chunks_to_upsert: list[dict[str, Any]] = []
     new_vecs: list[np.ndarray] = []
 
     batch_size = 20
@@ -201,7 +199,7 @@ def upsert_chunks_to_index(
                 break
 
             new_vecs.append(vec)
-            metadata.append(chunk)
+            chunks_to_upsert.append(chunk)
             stats["embedded"] += 1
 
         pct_done = min(i + batch_size, len(chunks))
@@ -209,14 +207,21 @@ def upsert_chunks_to_index(
             elapsed_pct = round(pct_done / len(chunks) * 100)
             print(f"  [{elapsed_pct}%] Embedded {pct_done}/{len(chunks)} chunks...")
 
-    # Batch-add to index
+    # Batch-add to index and MetadataStore
     if new_vecs and index is not None:
+        start_rowid = index.ntotal
         mat = np.stack(new_vecs, axis=0)
         index.add(mat)
         _save_faiss_index(index, index_path)
-        _save_metadata(metadata_path, metadata)
+        
+        # Upsert into MetadataStore (triggers V3 Parquet export)
+        store.upsert_chunks(chunks_to_upsert, start_rowid=start_rowid)
+        
+        # Also sync to legacy JSON for backward compatibility
+        store.export_json(METADATA_CANDIDATES[1]) # data/vector_db/metadata.json
+        
         print(f"[INDEX] Saved {len(new_vecs)} new vectors → {index_path}")
-        print(f"[META]  Total metadata entries: {len(metadata)} → {metadata_path}")
+        print(f"[META]  Synced with MetadataStore → {store.db_path}")
 
     return stats
 

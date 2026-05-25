@@ -121,6 +121,47 @@ class ReflectionEngine:
 
         return _call
 
+    def assess_context_gaps(self, context: str, question: str, iteration: int) -> list[str]:
+        """
+        Assess the retrieved context against the user question.
+        Returns a list of gap descriptions. If none, the context is sufficient.
+        """
+        if iteration > 0 or len(context) < 100:
+            return []
+            
+        prompt = (
+            "You are an elite institutional Critic Agent (LLM-as-a-Judge). Your sole purpose is to "
+            "ruthlessly audit retrieved context against the user's question to prevent hallucinations "
+            "and enforce high-fidelity research standards.\n\n"
+            "Evaluate the provided Context based on the following criteria:\n"
+            "1. **Faithfulness**: Are quotes, metrics, or events explicitly supported by the text?\n"
+            "2. **Relevance**: Does the context genuinely address the core mechanism of the question?\n"
+            "3. **Quantitative Proof**: If the question implies numbers/metrics (e.g., 'how much', 'what is the current state'), are there hard data points present?\n\n"
+            "If the Context satisfies all criteria to deliver a Bloomberg-grade answer, return EXACTLY the single word: 'COMPLETE'.\n"
+            "If it fails any criteria, reject the context and list the EXACT missing information gaps clearly as bullet points. "
+            "Be highly specific (e.g. 'Missing current P/E ratio for Nvidia', NOT 'Missing financial data').\n\n"
+            f"Question: {question}\n\n"
+            f"Context (first 2500 chars):\n{context[:2500]}\n\n"
+            "Gaps:"
+        )
+        try:
+            llm = self._get_llm()
+            raw = llm(prompt).strip()
+
+            if "COMPLETE" in raw.upper() and len(raw) < 30:
+                return []
+
+            gaps: list[str] = []
+            for line in raw.splitlines():
+                line = line.strip().lstrip("-•*1234567890.)").strip()
+                if len(line) >= 10 and len(line) <= 200:
+                    if not any(line.lower() == g.lower() for g in gaps):
+                        gaps.append(line)
+            return gaps[:3]
+        except Exception as exc:
+            logger.debug("[ReflectionEngine] Context critique failed: %s", exc)
+            return []
+
     def _heuristic_gaps(self, draft: str, state: AgentState) -> list[str]:
         """Fast, LLM-free gap detection using pattern matching."""
         gaps: list[str] = []
@@ -134,18 +175,21 @@ class ReflectionEngine:
 
     def _llm_critique(self, draft: str, question: str) -> list[str]:
         """
-        Use LLM as a critic to identify analytical gaps in the draft answer.
-        Returns list of gap descriptions, or empty list on failure.
+        Use LLM as a Critic Agent to ruthlessly audit the draft report for 
+        analytical integrity, citation density, and quantitative grounding.
         """
         prompt = (
-            "You are a senior financial editor reviewing a draft analysis. "
-            "Identify the top 1-3 specific gaps, missing data points, or unsupported claims in this draft. "
-            "Be specific: name the exact missing piece (e.g. 'Missing: Fed Funds rate impact on mortgage spreads').\n\n"
-            "Be concise. Output ONLY the gaps, one per line, no explanation, no numbering.\n"
-            "If the draft is complete and high quality, output: COMPLETE\n\n"
+            "You are an elite Institutional Editor auditing a research report draft.\n"
+            "Evaluate the Draft based on these non-negotiable standards:\n"
+            "1. **Faithfulness**: Is every factual claim explicitly backed by a source citation [Sx]?\n"
+            "2. **Precision**: Does the draft use specific numbers/metrics where available, or does it use vague fillers?\n"
+            "3. **Logic**: Is the causal path clearly defined (e.g., why X causes Y)?\n\n"
+            "If the Draft is Bloomberg-grade and satisfies all criteria, return EXACTLY 'COMPLETE'.\n"
+            "If it fails, list the 1-3 most critical gaps or inaccuracies as concise bullet points. "
+            "Focus on missing data or unsupported conclusions.\n\n"
             f"Question: {question}\n\n"
-            f"Draft (first 1200 chars):\n{draft[:1200]}\n\n"
-            "Gaps:"
+            f"Draft (first 1500 chars):\n{draft[:1500]}\n\n"
+            "Audit Gaps:"
         )
         try:
             llm = self._get_llm()

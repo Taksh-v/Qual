@@ -64,6 +64,11 @@ def log_query(
     hallucination_risk: float | None = None,
     sentiment_label: str | None = None,
     sentiment_score: float | None = None,
+    retrieval_hybrid_enabled: bool | None = None,
+    retrieval_rrf_applied: bool | None = None,
+    retrieval_fallback_reason: str | None = None,
+    retrieval_top_chunks: list[dict] | None = None,
+    decision_id: str | None = None,
     error: str | None = None,
 ) -> None:
     """Append a single query event to the JSONL log. Thread-safe."""
@@ -81,6 +86,11 @@ def log_query(
         "hallucination_risk": round(hallucination_risk, 4) if hallucination_risk is not None else None,
         "sentiment_label":  sentiment_label,
         "sentiment_score":  round(sentiment_score, 4) if sentiment_score is not None else None,
+        "retrieval_hybrid_enabled": retrieval_hybrid_enabled,
+        "retrieval_rrf_applied": retrieval_rrf_applied,
+        "retrieval_fallback_reason": retrieval_fallback_reason,
+        "retrieval_top_chunks": (retrieval_top_chunks or [])[:8],
+        "decision_id": decision_id,
         "error":            error,
     }
     try:
@@ -155,6 +165,23 @@ def compute_metrics(entries: list[dict]) -> dict:
         b = e.get("quality_band") or "N/A"
         band_counts[b] = band_counts.get(b, 0) + 1
 
+    retrieval_entries = [e for e in entries if e.get("retrieval_hybrid_enabled") is not None]
+    retrieval_total = len(retrieval_entries)
+    hybrid_rate = (
+        round(sum(1 for e in retrieval_entries if e.get("retrieval_hybrid_enabled")) / retrieval_total * 100, 1)
+        if retrieval_total
+        else None
+    )
+    rrf_rate = (
+        round(sum(1 for e in retrieval_entries if e.get("retrieval_rrf_applied")) / retrieval_total * 100, 1)
+        if retrieval_total
+        else None
+    )
+    fallback_counts: dict[str, int] = {}
+    for e in retrieval_entries:
+        reason = str(e.get("retrieval_fallback_reason") or "none")
+        fallback_counts[reason] = fallback_counts.get(reason, 0) + 1
+
     return {
         "total_queries":          total,
         "cache_hit_rate_pct":     round(cache_hits / total * 100, 1),
@@ -164,6 +191,9 @@ def compute_metrics(entries: list[dict]) -> dict:
         "avg_latency_ms":         avg_latency,
         "p95_latency_ms":         p95_latency,
         "model_distribution":     model_dist,
+        "retrieval_hybrid_rate_pct": hybrid_rate,
+        "retrieval_rrf_rate_pct": rrf_rate,
+        "retrieval_fallback_dist": fallback_counts,
         "avg_hallucination_risk": avg_hallucination_risk,
         "high_hallucination_rate_pct": high_hal_rate_pct,
         "sentiment_distribution": sentiment_counts,

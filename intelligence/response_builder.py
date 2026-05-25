@@ -10,6 +10,8 @@ from intelligence.response_schema import (
     ResponseMetadata,
     Scenario,
     StructuredResponse,
+    CompanyImpact,
+    PolicyShift,
 )
 from intelligence.response_validator import ValidationReport, validate_structured_response
 from intelligence.writing_style import normalize_section_lines, normalize_whitespace
@@ -98,6 +100,10 @@ class BaseResponseBuilder:
         self._response.executive_summary = normalize_whitespace(text)
         return self
 
+    def strategic_synthesis(self, text: str) -> "BaseResponseBuilder":
+        self._response.strategic_synthesis = normalize_whitespace(text)
+        return self
+
     def key_risks(self, bullets: list[str]) -> "BaseResponseBuilder":
         self._response.key_risks = normalize_section_lines(bullets)
         return self
@@ -132,6 +138,28 @@ class BaseResponseBuilder:
         
     def data_gaps(self, gaps: list[str]) -> "BaseResponseBuilder":
         self._response.data_gaps = normalize_section_lines(gaps)
+        return self
+
+    def company_impact(self, entity: str, impact_rating: str, narrative: str, ticker: str | None = None) -> "BaseResponseBuilder":
+        self._response.corporate_intelligence.append(
+            CompanyImpact(
+                entity=normalize_whitespace(entity),
+                impact_rating=normalize_whitespace(impact_rating),
+                narrative=normalize_whitespace(narrative),
+                ticker=normalize_whitespace(ticker) if ticker else None
+            )
+        )
+        return self
+
+    def policy_shift(self, authority: str, policy_event: str, status: str, macro_implication: str) -> "BaseResponseBuilder":
+        self._response.policy_intelligence.append(
+            PolicyShift(
+                authority=normalize_whitespace(authority),
+                policy_event=normalize_whitespace(policy_event),
+                status=normalize_whitespace(status),
+                macro_implication=normalize_whitespace(macro_implication)
+            )
+        )
         return self
 
     def validate(self) -> ValidationReport:

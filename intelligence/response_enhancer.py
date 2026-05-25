@@ -46,11 +46,13 @@ _REQUIRED_SECTIONS_BRIEF = [
 
 _REQUIRED_SECTIONS_DETAILED = [
     "Regime:",
+    "Dominant theme:",
     "Executive summary:",
     "Direct answer:",
+    "Strategic synthesis",
     "Data snapshot:",
     "Causal architecture:",
-    "What is happening:",
+    "Situation Report:",
     "Cross-asset impact:",
     "Positioning:",
     "Predicted events:",
@@ -281,6 +283,8 @@ def _add_missing_section_stubs(text: str, missing: list[str]) -> str:
     stubs: dict[str, str] = {
         "Data snapshot:": "Data snapshot: Refer to live indicator section above.",
         "Causal architecture:": "Causal architecture:\nPrimary: Market dynamics → TBD",
+        "Strategic synthesis": "Strategic synthesis:\nTBD - analyze transmission channel and second-order effects.",
+        "Situation Report:": "Situation Report:\n- Evidence 1: TBD",
         "Cross-asset impact:": "Cross-asset impact:\n- Equities: ● Neutral — TBD",
         "Positioning:": "Positioning:\n- Neutral: Broad indices — TBD",
         "Predicted events:": "Predicted events:\n- Event 1 (7-30d, ~55%): Baseline continuation of current regime dynamics; trigger: confirmation; invalidation: opposite.",
@@ -304,7 +308,7 @@ def _compute_quality_score(report: EnhancementReport) -> int:
       - No citations:              -5
     """
     score = 100
-    critical = {"Direct answer:", "Market impact:", "Predicted events:", "Causal chain:", "Scenarios"}
+    critical = {"Direct answer:", "Market impact:", "Predicted events:", "Causal chain:", "Scenarios", "Strategic synthesis", "Situation Report:"}
     critical_missing = len([s for s in report.missing_sections if s in critical])
     score -= critical_missing * 10
     score -= min(report.vague_bullets_count * 5, 20)

@@ -1,5 +1,6 @@
 import importlib
 import json
+from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
@@ -42,6 +43,30 @@ def _fake_pipeline_no_enrichment(*args, **kwargs) -> Iterator[str]:
     yield "Direct answer: Growth is moderating while inflation cools.\n"
     yield "Market impact: Equities supported, yields drift lower.\n"
     yield "Confidence: MEDIUM - External enrichment unavailable, base analysis used.\n"
+
+
+class _FakeOrchestratorEnriched:
+    async def run_async(self, *args, **kwargs):
+        text = "".join(_fake_pipeline())
+        yield SimpleNamespace(stage="planning", data={}, agent_name=None)
+        yield SimpleNamespace(stage="retrieval", data={"chunks_retrieved": 2}, agent_name=None)
+        yield SimpleNamespace(stage="agent_start", data={}, agent_name=None)
+        yield SimpleNamespace(stage="agent_brief", data={}, agent_name="macro")
+        yield SimpleNamespace(stage="synthesis", data={}, agent_name=None)
+        yield SimpleNamespace(stage="token", data={"text": text}, agent_name=None)
+        yield SimpleNamespace(stage="final", data={}, agent_name=None)
+
+
+class _FakeOrchestratorNoEnrichment:
+    async def run_async(self, *args, **kwargs):
+        text = "".join(_fake_pipeline_no_enrichment())
+        yield SimpleNamespace(stage="planning", data={}, agent_name=None)
+        yield SimpleNamespace(stage="retrieval", data={"chunks_retrieved": 1}, agent_name=None)
+        yield SimpleNamespace(stage="agent_start", data={}, agent_name=None)
+        yield SimpleNamespace(stage="agent_brief", data={}, agent_name="macro")
+        yield SimpleNamespace(stage="synthesis", data={}, agent_name=None)
+        yield SimpleNamespace(stage="token", data={"text": text}, agent_name=None)
+        yield SimpleNamespace(stage="final", data={}, agent_name=None)
 
 
 @pytest.fixture()
@@ -99,7 +124,10 @@ def test_intelligence_analyze_includes_external_mcp_context(client: TestClient) 
     assert isinstance(payload.get("_response_contract", {}).get("validation_ok"), bool)
 
 
-def test_intelligence_stream_emits_enriched_final_payload(client: TestClient) -> None:
+def test_intelligence_stream_emits_enriched_final_payload(client: TestClient, monkeypatch) -> None:
+    orchestrator_mod = importlib.import_module("intelligence.agentic_rag.orchestrator")
+    monkeypatch.setattr(orchestrator_mod, "AgenticOrchestrator", _FakeOrchestratorEnriched)
+
     response = client.post(
         "/intelligence/stream",
         json={
@@ -161,6 +189,8 @@ def test_intelligence_stream_succeeds_without_external_enrichment(
 ) -> None:
     api_app = importlib.import_module("api.app")
     monkeypatch.setattr(api_app, "macro_intelligence_pipeline", _fake_pipeline_no_enrichment)
+    orchestrator_mod = importlib.import_module("intelligence.agentic_rag.orchestrator")
+    monkeypatch.setattr(orchestrator_mod, "AgenticOrchestrator", _FakeOrchestratorNoEnrichment)
 
     response = client.post(
         "/intelligence/stream",

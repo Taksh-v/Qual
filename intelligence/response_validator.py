@@ -25,6 +25,9 @@ class ValidationReport:
 
 def validate_structured_response(resp: StructuredResponse) -> ValidationReport:
     issues: list[ValidationIssue] = []
+    valid_integrity_status = {"pass", "warning", "review_required"}
+    valid_warning_tiers = {"watch", "elevated", "imminent"}
+    valid_enforcement_modes = {"advisory", "strict"}
 
     if not resp.direct_answer.strip():
         issues.append(ValidationIssue(code="missing_direct_answer", message="Direct answer is missing.", severity="error"))
@@ -43,6 +46,10 @@ def validate_structured_response(resp: StructuredResponse) -> ValidationReport:
     if resp.metadata.mode == "detailed":
         if not resp.positioning:
             issues.append(ValidationIssue(code="missing_positioning", message="Positioning ideas are missing in detailed mode.", severity="warning"))
+        if not resp.corporate_intelligence:
+            issues.append(ValidationIssue(code="missing_corporate", message="Corporate intelligence is missing in detailed mode.", severity="warning"))
+        if not resp.policy_intelligence:
+            issues.append(ValidationIssue(code="missing_policy", message="Policy intelligence is missing in detailed mode.", severity="warning"))
         if len(resp.cross_asset_impacts) < 3 and len(resp.market_impact) < 3:
             issues.append(ValidationIssue(code="insufficient_cross_asset", message="Fewer than 3 cross-asset impacts provided in detailed mode.", severity="warning"))
 
@@ -77,6 +84,49 @@ def validate_structured_response(resp: StructuredResponse) -> ValidationReport:
             issues.append(ValidationIssue(code="event_missing_trigger", message=f"{event.label} is missing trigger."))
         if not event.invalidation or event.invalidation == "N/A":
             issues.append(ValidationIssue(code="event_missing_invalidation", message=f"{event.label} is missing invalidation."))
+
+    if resp.evidence_integrity and resp.evidence_integrity.status:
+        if resp.evidence_integrity.status not in valid_integrity_status:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_evidence_integrity_status",
+                    message=(
+                        "evidence_integrity.status must be one of "
+                        "pass|warning|review_required."
+                    ),
+                    severity="warning",
+                )
+            )
+
+    if resp.regime_warning and resp.regime_warning.warning_tier:
+        if resp.regime_warning.warning_tier not in valid_warning_tiers:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_regime_warning_tier",
+                    message="regime_warning.warning_tier must be watch|elevated|imminent.",
+                    severity="warning",
+                )
+            )
+
+    if resp.personalization and resp.personalization.enforcement_mode:
+        if resp.personalization.enforcement_mode not in valid_enforcement_modes:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_personalization_mode",
+                    message="personalization.enforcement_mode must be advisory|strict.",
+                    severity="warning",
+                )
+            )
+
+    if resp.counterfactual_result and resp.counterfactual_result.requested:
+        if not resp.counterfactual_result.delta_summary:
+            issues.append(
+                ValidationIssue(
+                    code="missing_counterfactual_delta",
+                    message="counterfactual_result.requested=true but delta_summary is empty.",
+                    severity="warning",
+                )
+            )
 
     has_error = any(i.severity == "error" for i in issues)
     return ValidationReport(ok=not has_error, issues=issues)

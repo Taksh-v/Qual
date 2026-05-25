@@ -32,12 +32,13 @@ from typing import Any
 # Special forms: BRK.B, BRK.A, BTC-USD, EUR/USD, ^GSPC (index)
 _TICKER_RE = re.compile(
     r"\b"
-    r"(\^[A-Z]{2,6}"                   # index: ^GSPC, ^DJI
-    r"|[A-Z]{2,6}\.[AB]"               # class shares: BRK.A, BRK.B
-    r"|[A-Z]{2,6}[-/][A-Z]{3}"        # fx / crypto: BTC-USD, EUR/USD
-    r"|[A-Z]{2,5}"                     # plain ticker: AAPL, TSLA, AMZN
+    r"(\^[A-Z]{1,6}"                   # index: ^GSPC, ^VIX
+    r"|[A-Z]{1,6}\.[AB]"               # class shares: BRK.A, BRK.B
+    r"|[A-Z]{2,6}[-/][A-Z]{3,4}"       # fx / crypto: BTC-USD, ETH-USDT
+    r"|[A-PH-Z][A-Z]{1,4}"             # plain ticker: AAPL, TSLA (avoids "A", "I")
     r")\b"
-    r"(?!\s*[a-z])"                    # not followed by lowercase (avoids "IT", "US" in sentences)
+    r"(?!\s*[a-z])",                   # not followed by lowercase
+    re.IGNORECASE,
 )
 
 # Common uppercase words that are NOT tickers (false-positive suppression)
@@ -63,35 +64,49 @@ _COMPANY_NAMES: list[str] = [
     "Netflix", "Nvidia", "AMD", "Intel", "Qualcomm", "Texas Instruments",
     "TSMC", "Samsung", "Sony", "LG", "Broadcom", "Cisco", "Oracle", "SAP",
     "Salesforce", "ServiceNow", "Snowflake", "Palantir", "Cloudflare",
+    "Adobe", "IBM", "Uber", "Airbnb", "Tesla", "SpaceX",
     # Finance
     "JPMorgan", "JP Morgan", "Goldman Sachs", "Morgan Stanley", "Citigroup",
     "Bank of America", "Wells Fargo", "BlackRock", "Vanguard", "Fidelity",
     "Charles Schwab", "Berkshire Hathaway", "Berkshire", "American Express",
-    "Visa", "Mastercard", "PayPal", "Square", "Block",
+    "Visa", "Mastercard", "PayPal", "Square", "Block", "Robinhood",
+    "Dhan", "Zerodha", "Upstox", "Groww", "Angel One",
     # Energy
     "ExxonMobil", "Exxon", "Chevron", "Shell", "BP", "TotalEnergies",
     "ConocoPhillips", "Halliburton", "Schlumberger", "SLB", "Valero",
-    "Occidental", "Pioneer Natural", "Devon Energy",
+    "Occidental", "Pioneer Natural", "Devon Energy", "Reliance",
     # Healthcare / Pharma
     "Johnson & Johnson", "Pfizer", "Moderna", "Merck", "AbbVie", "Eli Lilly",
     "Bristol-Myers", "AstraZeneca", "Novartis", "Roche", "UnitedHealth",
-    "CVS Health", "Anthem", "Humana",
+    "CVS Health", "Anthem", "Humana", "Moderna",
     # Consumer / Retail
     "Walmart", "Target", "Costco", "Home Depot", "Lowe's", "Nike", "Adidas",
     "McDonald's", "Starbucks", "Coca-Cola", "PepsiCo", "Procter & Gamble",
+    "LVMH", "Hermes", "Inditex", "Zara", "H&M",
     # Industrial / Transport
     "Boeing", "Airbus", "Lockheed Martin", "Raytheon", "General Electric",
-    "Caterpillar", "Deere", "FedEx", "UPS", "Union Pacific",
+    "Caterpillar", "Deere", "FedEx", "UPS", "Union Pacific", "Air India", "IndiGo",
     # Telecom / Media
-    "AT&T", "Verizon", "T-Mobile", "Comcast", "Disney", "Warner Bros",
+    "AT&T", "Verizon", "T-Mobile", "Comcast", "Disney", "Warner Bros", "Netflix",
     # China Tech
-    "Alibaba", "Tencent", "Baidu", "ByteDance", "Meituan", "JD.com",
+    "Alibaba", "Tencent", "Baidu", "ByteDance", "Meituan", "JD.com", "Pinduoduo", "Xiaomi",
     # Crypto / Exchanges
-    "Coinbase", "Binance", "Kraken", "CME Group", "Intercontinental Exchange",
+    "Coinbase", "Binance", "Kraken", "CME Group", "Intercontinental Exchange", "Crypto.com",
 ]
 
 _COMPANY_RE = re.compile(
     r"\b(" + "|".join(re.escape(c) for c in sorted(_COMPANY_NAMES, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+# ─── Crypto assets ─────────────────────────────────────────────────────────────
+_CRYPTO_NAMES: list[str] = [
+    "Bitcoin", "Ethereum", "Solana", "Cardano", "Ripple", "Polkadot", "Dogecoin",
+    "Shiba Inu", "Avalanche", "Chainlink", "Polygon", "Litecoin", "Tether", "USDC",
+]
+
+_CRYPTO_RE = re.compile(
+    r"\b(" + "|".join(re.escape(c) for c in sorted(_CRYPTO_NAMES, key=len, reverse=True)) + r")\b",
     re.IGNORECASE,
 )
 
@@ -164,6 +179,7 @@ def extract_entities(text: str) -> dict[str, list[str]]:
     Returns a dict with keys:
         tickers    — stock/crypto/fx symbols
         companies  — company names
+        crypto     — cryptocurrency names
         indicators — economic indicators and institutions
         people     — notable finance/market people
         amounts    — dollar amounts
@@ -182,21 +198,25 @@ def extract_entities(text: str) -> dict[str, list[str]]:
     # 2. Companies
     companies = list(dict.fromkeys(m.group() for m in _COMPANY_RE.finditer(text)))
 
-    # 3. Indicators
+    # 3. Crypto
+    crypto = list(dict.fromkeys(m.group() for m in _CRYPTO_RE.finditer(text)))
+
+    # 4. Indicators
     indicators = list(dict.fromkeys(m.group() for m in _INDICATOR_RE.finditer(text)))
 
-    # 4. People
+    # 5. People
     people = list(dict.fromkeys(m.group() for m in _PEOPLE_RE.finditer(text)))
 
-    # 5. Dollar amounts
+    # 6. Dollar amounts
     amounts = list(dict.fromkeys(_AMOUNT_RE.findall(text)))
 
-    # 6. Percentages / bps
+    # 7. Percentages / bps
     percentages = list(dict.fromkeys(_PCT_RE.findall(text)))
 
     return {
         "tickers":     tickers[:10],
         "companies":   companies[:10],
+        "crypto":      crypto[:10],
         "indicators":  indicators[:10],
         "people":      people[:8],
         "amounts":     amounts[:8],
@@ -230,6 +250,6 @@ def flat_entity_list(entities: dict[str, list[str]]) -> list[str]:
 
 def _empty() -> dict[str, list[str]]:
     return {
-        "tickers": [], "companies": [], "indicators": [],
+        "tickers": [], "companies": [], "crypto": [], "indicators": [],
         "people": [], "amounts": [], "percentages": [],
     }

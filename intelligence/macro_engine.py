@@ -386,7 +386,7 @@ def macro_intelligence_pipeline(
     manual_indicators: dict | None = None,
     geography: str = "US",
     horizon: str = "MEDIUM_TERM",
-    response_mode: str = "brief",
+    response_mode: str | None = None,
 ) -> Iterator[str]:
     """
     Main pipeline for processing a user query.
@@ -421,7 +421,13 @@ def macro_intelligence_pipeline(
         s = time.time()
         classification = classify_question(question)
         latencies['question_classifier'] = time.time() - s
-        yield f"<<PROGRESS>>{json.dumps({'stage': 'question_classifier', 'time_ms': int(latencies['question_classifier'] * 1000)})}"
+        
+        # AUTO-ESCALATION: If depth is DEEP, force detailed mode for higher fidelity
+        # AUTO-ESCALATION: If depth is DEEP, force detailed mode for higher fidelity
+        if classification.get("depth") == "DEEP" and (response_mode is None or response_mode == "brief"):
+            response_mode = "detailed"
+            
+        yield f"<<PROGRESS>>{json.dumps({'stage': 'question_classifier', 'time_ms': int(latencies['question_classifier'] * 1000), 'depth': classification.get('depth'), 'escalated_to': response_mode})}"
     except Exception as e:
         yield f"[ERROR in question_classifier: {e}]"
         error_count += 1
